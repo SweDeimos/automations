@@ -1,0 +1,7 @@
+python-telegram-bot
+requests
+qbittorrent-api
+plexapi
+python-dotenv
+rarfile
+patool
