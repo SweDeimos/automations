@@ -1,0 +1,51 @@
+# Ignore Python virtual environments
+venv/
+.env
+
+# Ignore compiled Python files
+__pycache__/
+*.py[cod]
+
+# Ignore logs and debug files
+*.log
+debug.log
+
+# Ignore system-specific files
+.DS_Store
+Thumbs.db
+
+# Ignore Pytest cache
+tests/__pycache__/
+.pytest_cache/
+
+# Ignore IDE/editor settings
+.vscode/
+.idea/
+*.iml
+
+# Ignore dependencies installed via pipenv or poetry
+Pipfile
+tests/.pytest_cache/
+Pipfile.lock
+poetry.lock
+
+# Ignore Telegram bot session files
+*.session
+*.session-journal
+
+# Ignore database files (if any)
+*.sqlite3
+*.db
+
+# Ignore any torrent-related files
+*.torrent
+
+# Ignore coverage reports
+htmlcov/
+.coverage
+coverage.xml
+
+# Ignore build artifacts
+dist/
+build/
+*.egg-info/
