@@ -30,7 +30,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Hello! Send me a movie title, and I'll search for a torrent.")
+    return MOVIE
 
 async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     movie_title = update.message.text.strip()
@@ -115,8 +117,8 @@ async def select_torrent_callback(update: Update, context: ContextTypes.DEFAULT_
     try:
         idx = int(selection) - 1
     except ValueError:
-        await query.edit_message_text("Invalid selection. Please try again.")
-        return SELECT
+        await process_torrent(update, context, selected, info_hash)
+        return MOVIE 
 
     torrents = context.user_data.get("torrent_results")
     if torrents and 0 <= idx < len(torrents):
@@ -152,6 +154,7 @@ async def process_torrent(update: Update, context: ContextTypes.DEFAULT_TYPE, se
         else:
             await update.message.reply_text(f"Download failed for '{selected['name']}'.")
             await send_notification(update, context, f"Download failed for '{selected['name']}'.")
+            await update.message.reply_text("You can search for another movie by sending its title:")
 
     except Exception as e:
         logger.error(f"Error during download/processing: {e}")
@@ -202,6 +205,7 @@ def main() -> None:
             SELECT: [CallbackQueryHandler(select_torrent_callback)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
     )
 
     application.add_handler(conv_handler)
