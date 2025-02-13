@@ -22,7 +22,8 @@ from datetime import datetime
 from typing import Dict, List
 from rate_limiter import rate_limit
 from uuid import uuid4
-from security import restricted_access
+from security import restricted_access, admin_only, check_file_size_limit
+from user_manager import user_manager, UserRole
 
 # Define conversation states
 MOVIE, SELECT, CONFIRM, HISTORY_SELECT, FEEDBACK = range(5)
@@ -82,6 +83,15 @@ def async_error_handler(func):
 @restricted_access()
 @async_error_handler
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    username = update.effective_user.username or "Unknown"
+    
+    # Register user if not exists
+    if not user_manager.get_user(user_id):
+        user_manager.add_user(user_id, username)
+    else:
+        user_manager.update_last_active(user_id)
+    
     await update.message.reply_text(
         "Hello! Send me a movie title, and I'll search for a torrent.\n\n"
         "Use /help to see all available commands."
@@ -110,43 +120,66 @@ async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     status_message = await update.message.reply_text("🔍 Searching for torrents...")
     
     try:
-        torrents = search_tpb(movie_title)
-        # Edit the status message with results
-        await status_message.edit_text(f"Found {len(torrents) if torrents else 0} results for '{movie_title}'")
-        
-        if not torrents:
-            await update.message.reply_text(
-                "No torrents found for that title.\n"
-                "Tips:\n"
-                "• Check for typos in the movie title\n"
-                "• Try using the original title\n"
-                "• Remove special characters\n"
-                "Please try another search."
-            )
-            context.user_data.clear()
-            return MOVIE
+        if 'search_page' not in context.user_data:
+            # New search
+            torrents = search_tpb(movie_title)
+            user_id = update.effective_user.id
             
-        top_5_torrents = torrents[:5]
-        message = "Found these torrents:\n"
+            # Filter torrents based on user's size limit
+            allowed_torrents = [
+                torrent for torrent in torrents 
+                if user_manager.can_access_file_size(user_id, int(torrent.get('size', 0)))
+            ]
+            
+            if not allowed_torrents:
+                await update.message.reply_text(
+                    "No suitable torrents found within your size limit (5GB).\n"
+                    "Try another search or contact an administrator."
+                )
+                return MOVIE
+            
+            # Store all results and current page
+            context.user_data['all_results'] = allowed_torrents
+            context.user_data['search_page'] = 0
+        
+        # Get current page of results
+        page = context.user_data['search_page']
+        all_results = context.user_data['all_results']
+        start_idx = page * 5
+        top_5_torrents = all_results[start_idx:start_idx + 5]
+        
+        message = f"Found {len(all_results)} torrents (showing {start_idx + 1}-{start_idx + len(top_5_torrents)}):\n\n"
         for idx, torrent in enumerate(top_5_torrents, start=1):
             try:
-                size_bytes = int(torrent.get('size', 0))  # Use get() with default value
+                size_bytes = int(torrent.get('size', 0))
                 size_mb = size_bytes / (1024 * 1024)
                 size_gb = size_bytes / (1024 * 1024 * 1024)
                 size_str = f"{size_gb:.2f} GB" if size_gb > 1 else f"{size_mb:.2f} MB"
                 message += f"{idx}. {torrent.get('name', 'Unknown')} | Size: {size_str} | Seeds: {torrent.get('seeders', 'N/A')}\n"
             except (ValueError, TypeError) as e:
-                logger.warning(f"Error converting size for torrent {torrent.get('name', 'Unknown')}: {e}. Size: {torrent.get('size')}")
+                logger.warning(f"Error converting size for torrent {torrent.get('name', 'Unknown')}: {e}")
                 message += f"{idx}. {torrent.get('name', 'Unknown')} | Size: N/A | Seeds: {torrent.get('seeders', 'N/A')}\n"
-        message += "\nType a number to choose a torrent."
-
-        # Create inline keyboard buttons with numbers
+        
+        # Create navigation buttons
         keyboard = [
-            [InlineKeyboardButton(f"{idx}. {torrent.get('name', 'Unknown')}", callback_data=str(idx))]
+            [InlineKeyboardButton(f"{idx}. {torrent.get('name', 'Unknown')}", callback_data=f"select_{idx}")]
             for idx, torrent in enumerate(top_5_torrents, start=1)
         ]
+        
+        # Add navigation row if there are more results
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data="prev_page"))
+        if (page + 1) * 5 < len(all_results):
+            nav_row.append(InlineKeyboardButton("Next ➡️", callback_data="next_page"))
+        if nav_row:
+            keyboard.append(nav_row)
+            
+        # Add search again button
+        keyboard.append([InlineKeyboardButton("🔄 New Search", callback_data="new_search")])
+        
         reply_markup = InlineKeyboardMarkup(keyboard)
-
+        
         context.user_data["torrent_results"] = top_5_torrents
         await update.message.reply_text(message, reply_markup=reply_markup)
         return SELECT
@@ -154,33 +187,7 @@ async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         logger.error(f"Error searching for movie: {e}")
         raise  # This will be caught by the error handler decorator
 
-@async_error_handler
-async def select_torrent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # In case of text-based selection (if used)
-    try:
-        idx = int(update.message.text) - 1
-    except ValueError:
-        await update.message.reply_text("Invalid input. Please enter a number.")
-        return SELECT
-
-    torrents = context.user_data.get("torrent_results")
-    if torrents and 0 <= idx < len(torrents):
-        selected = torrents[idx]
-        await update.message.reply_text(
-            f"You selected: {selected['name']}\nAdding torrent to qBittorrent..."
-        )
-        info_hash = add_torrent(selected)
-        if info_hash:
-            await update.message.reply_text("Torrent added successfully. Monitoring download...")
-            asyncio.create_task(process_torrent(update, context, selected, info_hash))
-            return ConversationHandler.END
-        else:
-            await update.message.reply_text("Failed to add torrent.")
-            return ConversationHandler.END
-    else:
-        await update.message.reply_text("Invalid selection. Please try again.")
-        return SELECT
-
+@check_file_size_limit()
 @rate_limit("select_torrent")
 @async_error_handler
 async def select_torrent_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -188,66 +195,31 @@ async def select_torrent_callback(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     
     try:
-        # Check if this is a confirmation response
-        if query.data.startswith('confirm_'):
+        if query.data == "next_page":
+            context.user_data['search_page'] += 1
+            return await search_movie(update, context)
+        elif query.data == "prev_page":
+            context.user_data['search_page'] -= 1
+            return await search_movie(update, context)
+        elif query.data == "new_search":
+            # Clear search data and prompt for new search
+            context.user_data.pop('search_page', None)
+            context.user_data.pop('all_results', None)
+            await query.edit_message_text("Please enter a new movie title to search for.")
+            return MOVIE
+        elif query.data.startswith('select_'):
+            # Handle torrent selection
+            idx = int(query.data.split('_')[1]) - 1
+            return await handle_torrent_selection(update, context, idx)
+        elif query.data.startswith('confirm_'):
             return await handle_confirmation(update, context)
             
-        idx = int(query.data) - 1
     except ValueError:
         await query.edit_message_text(
-            "Invalid selection format.\n"
+            "Invalid selection.\n"
             "Please select one of the numbered options above."
         )
         return SELECT
-
-    torrents = context.user_data.get("torrent_results")
-    if not torrents:
-        await query.edit_message_text(
-            "Search results expired.\n"
-            "Please start a new search with /start"
-        )
-        return ConversationHandler.END
-        
-    if not (0 <= idx < len(torrents)):
-        await query.edit_message_text(
-            "Invalid selection number.\n"
-            "Please select one of the available options."
-        )
-        return SELECT
-
-    selected = torrents[idx]
-    
-    # Store the selected torrent in user_data for confirmation
-    context.user_data['selected_torrent'] = selected
-    
-    # Create confirmation message with details
-    size_bytes = int(selected.get('size', 0))
-    size_gb = size_bytes / (1024 * 1024 * 1024)
-    safe_name = selected['name'].replace('-', '\\-').replace('.', '\\.').replace('_', '\\_')
-    confirm_message = (
-        f"📽 *Confirm Download*\n\n"
-        f"*Title:* `{safe_name}`\n"
-        f"*Size:* `{size_gb:.2f} GB`\n"
-        f"*Seeders:* `{selected.get('seeders', 'N/A')}`\n\n"
-        "Are you sure you want to download this torrent?"
-    )
-    
-    # Create confirmation buttons
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Yes, download it", callback_data=f"confirm_yes"),
-            InlineKeyboardButton("❌ No, cancel", callback_data=f"confirm_no")
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        confirm_message,
-        reply_markup=reply_markup,
-        parse_mode='MarkdownV2'
-    )
-    
-    return CONFIRM
 
 @async_error_handler
 async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -432,33 +404,25 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 @rate_limit("history")
 @async_error_handler
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show user's search and download history"""
     if not context.user_data.get('search_history'):
-        await update.message.reply_text(
-            "No search history found\\.\n"
-            "Start searching for movies with /start"
-        )
+        await update.message.reply_text("No search history available.")
         return
-
-    # Get search history
+        
     history = context.user_data['search_history']
-    message = "🕒 *Your Recent Searches*\n\n"
+    message = "📖 *Your Recent Searches*\n\n"
     
-    for idx, entry in enumerate(reversed(history[-10:]), 1):  # Show last 10 searches
-        timestamp = entry['timestamp'].strftime("%Y-%m-%d %H:%M")
-        status = "✅" if entry.get('downloaded') else "🔍"
-        # Escape special characters in query and names
-        safe_query = entry['query'].replace('-', '\\-').replace('.', '\\.').replace('_', '\\_')
-        message += (
-            f"{idx}\\. {status} `{safe_query}`\n"
-            f"    📅 {timestamp}\n"
-        )
-        if entry.get('selected_torrent'):
-            safe_name = entry['selected_torrent']['name'].replace('-', '\\-').replace('.', '\\.').replace('_', '\\_')
-            message += f"    📥 Selected: `{safe_name}`\n"
-        message += "\n"
-    
-    message += "\nUse /search\\_again \\<number\\> to repeat a search"
+    for entry in reversed(history[-10:]):  # Show last 10 searches
+        # Escape special characters for MarkdownV2
+        query = entry['query'].replace('-', '\\-').replace('.', '\\.').replace('_', '\\_')
+        timestamp = entry['timestamp'].strftime("%Y\\-%m\\-%d %H:%M")
+        
+        if entry.get('downloaded'):
+            torrent_name = entry.get('selected_torrent', {}).get('name', 'Unknown')
+            # Escape special characters in torrent name
+            safe_name = torrent_name.replace('-', '\\-').replace('.', '\\.').replace('_', '\\_')
+            message += f"🎬 *{query}*\n📅 {timestamp}\n✅ Downloaded: `{safe_name}`\n\n"
+        else:
+            message += f"🎬 *{query}*\n📅 {timestamp}\n❌ Not downloaded\n\n"
     
     await update.message.reply_text(message, parse_mode='MarkdownV2')
 
@@ -720,13 +684,81 @@ async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     
     await update.inline_query.answer(results, cache_time=300)
 
+# Add new admin commands
+@admin_only()
+@async_error_handler
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = "*Registered Users:*\n\n"
+    for user in user_manager.users.values():
+        message += (
+            f"ID: `{user.user_id}`\n"
+            f"Username: @{user.username}\n"
+            f"Role: {user.role.value}\n"
+            f"Created: {user.created_at[:10]}\n"
+            f"Last active: {user.last_active[:10]}\n\n"
+        )
+    await update.message.reply_text(message, parse_mode='MarkdownV2')
+
+@admin_only()
+@async_error_handler
+async def promote_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = int(context.args[0])
+        if user := user_manager.get_user(user_id):
+            user.role = UserRole.ADMIN
+            user.max_file_size = float('inf')
+            user_manager.save_users()
+            await update.message.reply_text(f"User {user_id} promoted to admin.")
+        else:
+            await update.message.reply_text("User not found.")
+    except (ValueError, IndexError):
+        await update.message.reply_text("Usage: /promote <user_id>")
+
+@async_error_handler
+async def handle_torrent_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: int) -> int:
+    """Handle torrent selection and show confirmation"""
+    query = update.callback_query
+    torrents = context.user_data.get("torrent_results")
+    
+    if not torrents or not (0 <= idx < len(torrents)):
+        await query.edit_message_text("Invalid selection or expired results. Please try again.")
+        return SELECT
+    
+    selected = torrents[idx]
+    context.user_data['selected_torrent'] = selected
+    
+    # Create confirmation message with details
+    size_bytes = int(selected.get('size', 0))
+    size_gb = size_bytes / (1024 * 1024 * 1024)
+    safe_name = selected['name'].replace('-', '\\-').replace('.', '\\.').replace('_', '\\_')
+    confirm_message = (
+        f"📽 *Confirm Download*\n\n"
+        f"*Title:* `{safe_name}`\n"
+        f"*Size:* `{size_gb:.2f} GB`\n"
+        f"*Seeders:* `{selected.get('seeders', 'N/A')}`\n\n"
+        "Are you sure you want to download this torrent?"
+    )
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Yes, download it", callback_data="confirm_yes"),
+            InlineKeyboardButton("❌ No, cancel", callback_data="confirm_no")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(confirm_message, reply_markup=reply_markup, parse_mode='MarkdownV2')
+    return CONFIRM
+
 def main() -> None:
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
+    # Create conversation handler for the main flow
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
-            CommandHandler("search_again", search_again_command)
+            CommandHandler("search_again", search_again_command),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, search_movie),
         ],
         states={
             MOVIE: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_movie)],
@@ -738,12 +770,15 @@ def main() -> None:
         allow_reentry=True,
     )
 
+    # Add all handlers
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler("recent", recent_movies))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("history", history_command))
     application.add_handler(CommandHandler("feedback", feedback_history_command))
     application.add_handler(InlineQueryHandler(inline_search))
+    application.add_handler(CommandHandler("list_users", list_users))
+    application.add_handler(CommandHandler("promote", promote_user))
     application.run_polling()
 
 if __name__ == '__main__':

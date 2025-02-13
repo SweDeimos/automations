@@ -37,8 +37,10 @@ poetry.lock
 *.sqlite3
 *.db
 
-# Ignore any torrent-related files
+# Ignore torrent-related files
 *.torrent
+downloads/
+torrents/
 
 # Ignore coverage reports
 htmlcov/
@@ -49,3 +51,34 @@ coverage.xml
 dist/
 build/
 *.egg-info/
+
+# Ignore sensitive data
+users.json
+config.py
+.env
+secrets/
+credentials/
+tokens/
+auth/
+
+# Ignore media files
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.m4v
+*.srt
+*.sub
+
+# Ignore temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Ignore backup files
+*.bak
+*~
+*.swp
+*.swo
+backup/

@@ -1,126 +1,466 @@
-import pytest
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+import pytest
+from unittest.mock import Mock, patch
+from telegram import Update, Message, Chat, User, CallbackQuery, InlineKeyboardMarkup, InlineQuery
+from telegram.ext import ContextTypes, ConversationHandler, InlineQueryHandler
+from bot import (
+    help_command, search_movie, select_torrent_callback, process_torrent,
+    handle_confirmation, history_command, search_again_command,
+    request_feedback, handle_feedback, feedback_history_command,
+    MOVIE, SELECT, CONFIRM, FEEDBACK, inline_search
+)
+from datetime import datetime
+import pytest_asyncio
 
-# Import handlers from your bot module.
-from bot import start, search_movie, cancel, select_torrent_callback
+# Helper function to create mock Update and Context objects
+async def create_mock_update_context(message_text=None, callback_data=None):
+    update = Mock(spec=Update)
+    context = Mock(spec=ContextTypes.DEFAULT_TYPE)
+    context.user_data = {}
+    context.bot = AsyncMock()
+    
+    # Mock user info
+    user = Mock(spec=User)
+    user.id = 123
+    chat = Mock(spec=Chat)
+    chat.id = 123
+    
+    if message_text is not None:
+        # Mock message
+        message = Mock(spec=Message)
+        message.text = message_text
+        message.chat = chat
+        message.from_user = user
+        message.reply_text = AsyncMock()
+        update.message = message
+        update.callback_query = None
+        update.effective_chat = chat
+    
+    if callback_data is not None:
+        # Mock callback query
+        query = Mock(spec=CallbackQuery)
+        query.data = callback_data
+        query.message = Mock(spec=Message)
+        query.message.chat = chat
+        query.message.reply_text = AsyncMock()
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update.callback_query = query
+        update.message = None
+        update.effective_chat = chat
+    
+    return update, context
 
-# --- Dummy Classes to Simulate Telegram Objects ---
+# Helper class for mocking async methods
+class AsyncMock(Mock):
+    async def __call__(self, *args, **kwargs):
+        return super(AsyncMock, self).__call__(*args, **kwargs)
 
-class DummyMessage:
-    def __init__(self, text=None, chat_id="test_chat"):
-        self.text = text
-        self.chat_id = chat_id
-        self.sent_messages = []
+# Add this fixture
+@pytest_asyncio.fixture
+async def cleanup_tasks():
+    tasks = []
+    yield tasks
+    # Cleanup all tasks after test
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
-    async def reply_text(self, text, **kwargs):
-        self.sent_messages.append(text)
-
-class DummyCallbackQuery:
-    def __init__(self, data, message):
-        self.data = data
-        self.message = message
-
-    async def answer(self):
-        # Simulate acknowledging the callback.
-        pass
-
-    async def edit_message_text(self, text, **kwargs):
-        # Simulate editing the original message.
-        self.message.sent_messages.append(text)
-
-class DummyBot:
-    def __init__(self):
-        self.sent_messages = []
-
-    async def send_message(self, chat_id, text, **kwargs):
-        self.sent_messages.append(text)
-
-class DummyUpdate:
-    def __init__(self, message=None, callback_query=None):
-        self.message = message
-        self.callback_query = callback_query
-
-class DummyContext:
-    def __init__(self):
-        self.user_data = {}
-        self.bot = DummyBot()
-
-# --- Test Cases ---
+# Test cases
+@pytest.mark.asyncio
+async def test_help_command():
+    update, context = await create_mock_update_context(message_text="/help")
+    await help_command(update, context)
+    
+    # Verify help message was sent
+    update.message.reply_text.assert_called_once()
+    args, kwargs = update.message.reply_text.call_args
+    assert "Movie Download Bot Help" in args[0]
+    assert kwargs.get("parse_mode") == "MarkdownV2"
 
 @pytest.mark.asyncio
-async def test_start_handler():
-    """Test that the start handler sends the welcome message and returns the correct state."""
-    dummy_message = DummyMessage()
-    update = DummyUpdate(message=dummy_message)
-    context = DummyContext()
-
-    state = await start(update, context)
-    # The start handler should return MOVIE (typically 0)
-    assert state == 0
-    # Check if a welcome message is sent.
-    assert any("Hello!" in msg for msg in dummy_message.sent_messages)
+async def test_search_movie_empty_title():
+    update, context = await create_mock_update_context(message_text="")
+    result = await search_movie(update, context)
+    
+    # Verify error message for empty title
+    update.message.reply_text.assert_called_once_with("Please provide a movie title to search for.")
+    assert result == 0  # MOVIE state
 
 @pytest.mark.asyncio
-async def test_cancel_handler():
-    """Test that the cancel handler sends the cancellation message and returns ConversationHandler.END."""
-    dummy_message = DummyMessage()
-    update = DummyUpdate(message=dummy_message)
-    context = DummyContext()
-
-    state = await cancel(update, context)
-    # Check that the cancellation message is sent.
-    assert any("Operation cancelled" in msg for msg in dummy_message.sent_messages)
-    # Optionally, if you rely on ConversationHandler.END, check state. For now, we assume it returns a value.
+@patch('bot.search_tpb')
+async def test_search_movie_no_results(mock_search):
+    mock_search.return_value = []
+    update, context = await create_mock_update_context(message_text="Nonexistent Movie")
+    status_message = AsyncMock()
+    update.message.reply_text = AsyncMock(return_value=status_message)
+    
+    result = await search_movie(update, context)
+    
+    # Get the last call's arguments
+    last_message = update.message.reply_text.call_args_list[-1][0][0]
+    assert "No torrents found" in last_message
+    assert "Tips:" in last_message
+    assert result == MOVIE
 
 @pytest.mark.asyncio
-async def test_search_movie_handler():
-    """Test that search_movie calls search_tpb and sends the torrent results message."""
-    dummy_message = DummyMessage(text="Fake Movie Title")
-    update = DummyUpdate(message=dummy_message)
-    context = DummyContext()
+@patch('bot.search_tpb')
+async def test_search_movie_connection_error(mock_search):
+    mock_search.side_effect = ConnectionError("Failed to connect")
+    update, context = await create_mock_update_context(message_text="Movie Title")
+    status_message = AsyncMock()
+    update.message.reply_text = AsyncMock(return_value=status_message)
+    
+    await search_movie(update, context)
+    
+    # Get the last error message
+    last_message = update.message.reply_text.call_args_list[-1][0][0]
+    assert "Unable to connect to torrent site" in last_message
 
-    # Create a fake torrent list.
-    fake_torrents = [
-        {"name": "Torrent 1", "size": "104857600", "seeders": "50", "info_hash": "hash1", "magnet": "magnet:?xt=urn:btih:hash1"},
-        {"name": "Torrent 2", "size": "209715200", "seeders": "100", "info_hash": "hash2", "magnet": "magnet:?xt=urn:btih:hash2"},
+@pytest.mark.asyncio
+async def test_select_torrent_callback_expired():
+    update, context = await create_mock_update_context(callback_data="1")
+    context.user_data = {}  # Empty user data to simulate expired results
+    
+    result = await select_torrent_callback(update, context)
+    
+    # Verify expired results message
+    args, _ = update.callback_query.edit_message_text.call_args
+    assert "Search results expired" in args[0]
+    assert result == -1  # ConversationHandler.END
+
+@pytest.mark.asyncio
+async def test_torrent_confirmation_flow():
+    update, context = await create_mock_update_context(callback_data="confirm_yes")
+    context.user_data["selected_torrent"] = {
+        'name': 'Test Movie',
+        'size': '1073741824',
+        'seeders': '10'
+    }
+    
+    with patch('bot.add_torrent') as mock_add_torrent, \
+         patch('asyncio.create_task') as mock_create_task:  # Add this to prevent task creation
+        mock_add_torrent.return_value = "fake_hash"
+        result = await handle_confirmation(update, context)
+        
+        # Get all messages sent
+        messages = [call[0][0] for call in update.callback_query.edit_message_text.call_args_list]
+        # Verify that one of the messages contains our expected text
+        assert any("Starting download process" in msg for msg in messages)
+        assert result == ConversationHandler.END
+
+@pytest.mark.asyncio
+async def test_search_with_loading_indicator():
+    update, context = await create_mock_update_context(message_text="Test Movie")
+    context.bot = AsyncMock()
+    context.bot.send_chat_action = AsyncMock()
+    
+    # Mock the status message
+    status_message = AsyncMock()
+    status_message.edit_text = AsyncMock()
+    update.message.reply_text = AsyncMock(return_value=status_message)
+    
+    # Create a mock progress task
+    async def mock_progress():
+        return None
+    progress_task = asyncio.create_task(mock_progress())
+    
+    with patch('bot.search_tpb') as mock_search, \
+         patch('asyncio.create_task', return_value=progress_task), \
+         patch('asyncio.sleep', new_callable=AsyncMock), \
+         patch('bot.process_torrent', new_callable=AsyncMock):
+        
+        mock_search.return_value = [{'name': 'Test Movie', 'size': '1073741824', 'seeders': '10'}]
+        
+        try:
+            result = await search_movie(update, context)
+            
+            # Verify loading indicators
+            context.bot.send_chat_action.assert_called_once()
+            status_message.edit_text.assert_called_with("Found 1 results for 'Test Movie'")
+        finally:
+            # Clean up the task
+            if not progress_task.done():
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except asyncio.CancelledError:
+                    pass
+
+@pytest.mark.asyncio
+async def test_download_progress_updates():
+    update, context = await create_mock_update_context(callback_data="confirm_yes")
+    status_message = AsyncMock()
+    context.bot.send_message = AsyncMock(return_value=status_message)
+    
+    selected = {'name': 'Test Movie'}
+    info_hash = 'fake_hash'
+    
+    # Create a mock progress task that we can control
+    async def mock_progress():
+        return None
+    progress_task = asyncio.create_task(mock_progress())
+    
+    with patch('bot.monitor_download') as mock_monitor, \
+         patch('bot.unpack_download_if_needed') as mock_unpack, \
+         patch('bot.update_plex_library') as mock_plex, \
+         patch('bot.request_feedback') as mock_feedback, \
+         patch('asyncio.sleep', new_callable=AsyncMock), \
+         patch('asyncio.create_task', return_value=progress_task):
+        
+        mock_monitor.return_value = True
+        mock_unpack.return_value = None
+        mock_plex.return_value = "Plex updated successfully"
+        
+        # Run the process_torrent function
+        await process_torrent(update, context, selected, info_hash)
+        
+        # Verify the messages
+        calls = [call[0][0] for call in status_message.edit_text.call_args_list]
+        assert any("Processing downloaded files" in msg for msg in calls)
+        assert any("Adding to Plex library" in msg for msg in calls)
+        assert any("now on Plex" in msg for msg in calls)
+        
+        # Clean up the task
+        if not progress_task.done():
+            progress_task.cancel()
+            try:
+                await progress_task
+            except asyncio.CancelledError:
+                pass
+
+@pytest.mark.asyncio
+async def test_search_history():
+    update, context = await create_mock_update_context(message_text="Test Movie")
+    
+    # Perform a search
+    await search_movie(update, context)
+    
+    # Verify history was created
+    assert 'search_history' in context.user_data
+    assert len(context.user_data['search_history']) == 1
+    assert context.user_data['search_history'][0]['query'] == "Test Movie"
+
+@pytest.mark.asyncio
+async def test_history_command():
+    update, context = await create_mock_update_context(message_text="/history")
+    
+    # Add some test history
+    context.user_data['search_history'] = [
+        {
+            'query': 'Test Movie 1',
+            'timestamp': datetime.now(),
+            'downloaded': True,
+            'selected_torrent': {'name': 'Test.Movie.1.1080p'}
+        },
+        {
+            'query': 'Test Movie 2',
+            'timestamp': datetime.now(),
+            'downloaded': False
+        }
     ]
-    with patch("bot.search_tpb", return_value=fake_torrents):
-        state = await search_movie(update, context)
-        # search_movie should return the SELECT state (typically 1)
-        assert state == 1
-        # Check that a message with torrent details was sent.
-        assert any("Found these torrents" in msg for msg in dummy_message.sent_messages)
-        # Verify that the user_data was updated.
-        assert "torrent_results" in context.user_data
-        assert len(context.user_data["torrent_results"]) == len(fake_torrents[:5])
+    
+    await history_command(update, context)
+    
+    # Verify history message
+    args, kwargs = update.message.reply_text.call_args
+    assert "Your Recent Searches" in args[0]
+    assert "Test Movie 1" in args[0]
+    assert "Test Movie 2" in args[0]
+    assert kwargs.get('parse_mode') == 'MarkdownV2'
 
 @pytest.mark.asyncio
-async def test_select_torrent_callback_handler():
-    """Test that select_torrent_callback processes a valid selection correctly."""
-    # Prepare a dummy message and callback query with chat_id defined.
-    dummy_message = DummyMessage(chat_id="test_chat")
-    callback_query = DummyCallbackQuery(data="1", message=dummy_message)
-    update = DummyUpdate(callback_query=callback_query)
-    context = DummyContext()
-    context.bot = DummyBot()
-    # Pre-populate user_data with one fake torrent.
-    fake_torrents = [
-        {"name": "Torrent 1", "size": "104857600", "seeders": "50", "info_hash": "hash1", "magnet": "magnet:?xt=urn:btih:hash1"}
+async def test_search_again_command():
+    update, context = await create_mock_update_context(message_text="/search_again 1")
+    context.args = ["1"]  # Simulate command argument
+    
+    # Add test history
+    context.user_data['search_history'] = [
+        {
+            'query': 'Test Movie',
+            'timestamp': datetime.now(),
+            'downloaded': False
+        }
     ]
-    context.user_data["torrent_results"] = fake_torrents
+    
+    with patch('bot.search_movie') as mock_search:
+        mock_search.return_value = MOVIE
+        result = await search_again_command(update, context)
+        
+        # Verify search was repeated
+        mock_search.assert_called_once()
+        assert "Repeating search" in update.message.reply_text.call_args[0][0]
 
-    # Patch add_torrent to simulate a successful addition.
-    with patch("bot.add_torrent", return_value="hash1"):
-        # Patch asyncio.create_task so we can verify it is called.
-        with patch("bot.asyncio.create_task") as mock_create_task:
-            state = await select_torrent_callback(update, context)
-            # Verify that a task was scheduled to process the torrent.
-            mock_create_task.assert_called_once()
-            # Verify that a success message was sent via bot.send_message.
-            assert any("Torrent added successfully" in msg for msg in context.bot.sent_messages)
-            # Verify that the handler returns ConversationHandler.END.
-            assert state == -1
+@pytest.mark.asyncio
+async def test_request_feedback():
+    update, context = await create_mock_update_context(message_text="Test")
+    
+    result = await request_feedback(update, context)
+    
+    # Verify feedback request message and buttons
+    args, kwargs = update.message.reply_text.call_args
+    assert "How was your experience?" in args[0]
+    assert isinstance(kwargs.get('reply_markup'), InlineKeyboardMarkup)
+    assert result == FEEDBACK
 
+@pytest.mark.asyncio
+async def test_handle_feedback_skip():
+    update, context = await create_mock_update_context(callback_data="rate_skip")
+    
+    result = await handle_feedback(update, context)
+    
+    # Verify skip message
+    args, _ = update.callback_query.edit_message_text.call_args
+    assert "Thanks for using the bot" in args[0]
+    assert result == ConversationHandler.END
 
+@pytest.mark.asyncio
+async def test_handle_feedback_rating():
+    update, context = await create_mock_update_context(callback_data="rate_5")
+    
+    result = await handle_feedback(update, context)
+    
+    # Verify feedback was stored
+    assert 'feedback_history' in context.user_data
+    assert len(context.user_data['feedback_history']) == 1
+    assert context.user_data['feedback_history'][0]['rating'] == 5
+    
+    # Verify thank you message
+    args, _ = update.callback_query.edit_message_text.call_args
+    assert "Thanks for your 5⭐ rating" in args[0]
+    assert result == ConversationHandler.END
 
+@pytest.mark.asyncio
+async def test_handle_feedback_low_rating():
+    update, context = await create_mock_update_context(callback_data="rate_2")
+    
+    result = await handle_feedback(update, context)
+    
+    # Verify follow-up question for low rating
+    args, kwargs = update.callback_query.edit_message_text.call_args
+    assert "Could you tell us what went wrong?" in args[0]
+    assert isinstance(kwargs.get('reply_markup'), InlineKeyboardMarkup)
+    assert result == ConversationHandler.END
+
+@pytest.mark.asyncio
+async def test_feedback_history_command_empty():
+    update, context = await create_mock_update_context(message_text="/feedback")
+    
+    await feedback_history_command(update, context)
+    
+    # Verify empty history message
+    args, _ = update.message.reply_text.call_args
+    assert "No feedback history available" in args[0]
+
+@pytest.mark.asyncio
+async def test_feedback_history_command():
+    update, context = await create_mock_update_context(message_text="/feedback")
+    
+    # Add test feedback
+    context.user_data['feedback_history'] = [
+        {
+            'timestamp': datetime.now(),
+            'rating': 5,
+            'movie': 'Test Movie',
+            'reason': None
+        }
+    ]
+    
+    await feedback_history_command(update, context)
+    
+    # Verify feedback history display
+    args, kwargs = update.message.reply_text.call_args
+    assert "Recent Feedback History" in args[0]
+    assert "Test Movie" in args[0]
+    assert "⭐" * 5 in args[0]
+    assert kwargs.get('parse_mode') == 'MarkdownV2'
+
+@pytest.mark.asyncio
+async def test_process_torrent_with_feedback(cleanup_tasks):
+    update, context = await create_mock_update_context(callback_data="confirm_yes")
+    context.bot = AsyncMock()
+    status_message = AsyncMock()
+    context.bot.send_message = AsyncMock(return_value=status_message)
+    
+    selected = {'name': 'Test Movie'}
+    info_hash = 'fake_hash'
+    
+    # Create a mock progress task
+    async def mock_progress():
+        return None
+    progress_task = asyncio.create_task(mock_progress())
+    cleanup_tasks.append(progress_task)  # Add to cleanup list
+    
+    with patch('bot.monitor_download') as mock_monitor, \
+         patch('bot.unpack_download_if_needed') as mock_unpack, \
+         patch('bot.update_plex_library') as mock_plex, \
+         patch('bot.request_feedback') as mock_feedback, \
+         patch('bot.send_notification', new_callable=AsyncMock) as mock_notify, \
+         patch('asyncio.sleep', new_callable=AsyncMock), \
+         patch('asyncio.create_task', return_value=progress_task):
+        
+        mock_monitor.return_value = True
+        mock_unpack.return_value = None
+        mock_plex.return_value = "Plex updated successfully"
+        
+        # Start processing with timeout
+        try:
+            await asyncio.wait_for(
+                process_torrent(update, context, selected, info_hash),
+                timeout=5.0  # 5 second timeout
+            )
+        except asyncio.TimeoutError:
+            pytest.fail("Test timed out")
+        
+        # Verify feedback was requested
+        mock_feedback.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_inline_search_short_query():
+    update = Mock(spec=Update)
+    inline_query = Mock(spec=InlineQuery)
+    inline_query.query = "ab"
+    update.inline_query = inline_query
+    inline_query.answer = AsyncMock()
+    
+    context = Mock(spec=ContextTypes.DEFAULT_TYPE)
+    
+    await inline_search(update, context)
+    
+    # Verify response for short query
+    args = inline_query.answer.call_args[0][0]
+    assert len(args) == 1
+    assert "Enter at least 3 characters" in args[0].title
+
+@pytest.mark.asyncio
+@patch('bot.search_tpb')
+async def test_inline_search_results(mock_search):
+    # Mock search results
+    mock_search.return_value = [{
+        'name': 'Test Movie',
+        'size': '1073741824',  # 1 GB
+        'seeders': '10'
+    }]
+    
+    update = Mock(spec=Update)
+    inline_query = Mock(spec=InlineQuery)
+    inline_query.query = "test movie"
+    update.inline_query = inline_query
+    inline_query.answer = AsyncMock()
+    
+    context = Mock(spec=ContextTypes.DEFAULT_TYPE)
+    
+    await inline_search(update, context)
+    
+    # Verify search results
+    args = inline_query.answer.call_args[0][0]
+    assert len(args) == 1
+    assert "Test Movie" in args[0].title
+    assert "1.00 GB" in args[0].description
+
+if __name__ == "__main__":
+    pytest.main([__file__]) 

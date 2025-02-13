@@ -2,14 +2,6 @@ import pytest
 from unittest.mock import Mock, AsyncMock
 from telegram import Update, Message, User
 from telegram.ext import ContextTypes
-import sys
-from pathlib import Path
-
-# Add project root to Python path
-project_root = str(Path(__file__).parent.parent)
-if project_root not in sys.path:
-    sys.path.append(project_root)
-
 from security import SecurityManager, restricted_access
 from config import ALLOWED_USER_IDS
 

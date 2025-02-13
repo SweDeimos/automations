@@ -1,7 +1,12 @@
-python-telegram-bot
-requests
+python-telegram-bot>=20.0
+python-dotenv
 qbittorrent-api
 plexapi
-python-dotenv
 rarfile
 patool
+pytest
+pytest-asyncio
+setuptools
+requests
+aiohttp
+python-telegram-bot[job-queue]

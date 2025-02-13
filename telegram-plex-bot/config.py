@@ -15,6 +15,12 @@ PLEX_TOKEN = os.getenv("PLEX_TOKEN")
 
 # Add this to your existing config
 ALLOWED_USER_IDS = [
+    7631535095,  # Your admin ID
+    123456789,   # Regular user
+    987654321,   # Another regular user
+]
+
+# Add this to your existing config
+ADMIN_USER_IDS = [
     7631535095,  # Your Telegram ID
-    987654321,  # Another allowed user's ID
 ]
