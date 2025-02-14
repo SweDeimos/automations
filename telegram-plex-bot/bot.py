@@ -521,11 +521,18 @@ async def request_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await update.message.reply_text(
-        "How was your experience? Please rate the download:\n"
-        "(This helps us improve the service)",
-        reply_markup=reply_markup
-    )
+    if update.message:
+        await update.message.reply_text(
+            "How was your experience? Please rate the download:\n"
+            "(This helps us improve the service)",
+            reply_markup=reply_markup
+        )
+    elif update.callback_query:
+        await update.callback_query.message.reply_text(
+            "How was your experience? Please rate the download:\n"
+            "(This helps us improve the service)",
+            reply_markup=reply_markup
+        )
     return FEEDBACK
 
 @rate_limit("feedback")
