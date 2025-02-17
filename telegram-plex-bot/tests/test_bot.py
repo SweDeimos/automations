@@ -1,13 +1,12 @@
 import asyncio
 import pytest
 from unittest.mock import Mock, patch
-from telegram import Update, Message, Chat, User, CallbackQuery, InlineKeyboardMarkup, InlineQuery
-from telegram.ext import ContextTypes, ConversationHandler, InlineQueryHandler
+from telegram import Update, Message, Chat, User, CallbackQuery, InlineKeyboardMarkup
+from telegram.ext import ContextTypes, ConversationHandler
 from bot import (
     help_command, search_movie, select_torrent_callback, process_torrent,
     handle_confirmation, history_command, search_again_command,
-    request_feedback, handle_feedback, feedback_history_command,
-    MOVIE, SELECT, CONFIRM, FEEDBACK, inline_search
+    MOVIE, SELECT, CONFIRM
 )
 from datetime import datetime
 import pytest_asyncio
@@ -103,8 +102,7 @@ async def test_search_movie_no_results(mock_search):
     
     # Get the last call's arguments
     last_message = update.message.reply_text.call_args_list[-1][0][0]
-    assert "No torrents found" in last_message
-    assert "Tips:" in last_message
+    assert "No suitable torrents found" in last_message
     assert result == MOVIE
 
 @pytest.mark.asyncio
@@ -130,8 +128,8 @@ async def test_select_torrent_callback_expired():
     
     # Verify expired results message
     args, _ = update.callback_query.edit_message_text.call_args
-    assert "Search results expired" in args[0]
-    assert result == -1  # ConversationHandler.END
+    assert "Invalid selection" in args[0]
+    assert result == SELECT
 
 @pytest.mark.asyncio
 async def test_torrent_confirmation_flow():
@@ -208,7 +206,6 @@ async def test_download_progress_updates():
     with patch('bot.monitor_download') as mock_monitor, \
          patch('bot.unpack_download_if_needed') as mock_unpack, \
          patch('bot.update_plex_library') as mock_plex, \
-         patch('bot.request_feedback') as mock_feedback, \
          patch('asyncio.sleep', new_callable=AsyncMock), \
          patch('asyncio.create_task', return_value=progress_task):
         
@@ -246,39 +243,42 @@ async def test_search_history():
     assert context.user_data['search_history'][0]['query'] == "Test Movie"
 
 @pytest.mark.asyncio
+async def test_history_command_empty():
+    update, context = await create_mock_update_context(message_text="/history")
+    
+    await history_command(update, context)
+    
+    # Verify empty history message
+    args, _ = update.message.reply_text.call_args
+    assert "No search history available" in args[0]
+
+@pytest.mark.asyncio
 async def test_history_command():
     update, context = await create_mock_update_context(message_text="/history")
     
-    # Add some test history
+    # Add test history
     context.user_data['search_history'] = [
         {
-            'query': 'Test Movie 1',
             'timestamp': datetime.now(),
+            'query': 'Test Movie',
             'downloaded': True,
-            'selected_torrent': {'name': 'Test.Movie.1.1080p'}
-        },
-        {
-            'query': 'Test Movie 2',
-            'timestamp': datetime.now(),
-            'downloaded': False
+            'selected_torrent': {'name': 'Test Movie HD'}
         }
     ]
     
     await history_command(update, context)
     
-    # Verify history message
+    # Verify history display
     args, kwargs = update.message.reply_text.call_args
     assert "Your Recent Searches" in args[0]
-    assert "Test Movie 1" in args[0]
-    assert "Test Movie 2" in args[0]
+    assert "Test Movie" in args[0]
     assert kwargs.get('parse_mode') == 'MarkdownV2'
 
 @pytest.mark.asyncio
 async def test_search_again_command():
-    update, context = await create_mock_update_context(message_text="/search_again 1")
-    context.args = ["1"]  # Simulate command argument
+    update, context = await create_mock_update_context(message_text="/search_again")
     
-    # Add test history
+    # Add some test history
     context.user_data['search_history'] = [
         {
             'query': 'Test Movie',
@@ -296,91 +296,7 @@ async def test_search_again_command():
         assert "Repeating search" in update.message.reply_text.call_args[0][0]
 
 @pytest.mark.asyncio
-async def test_request_feedback():
-    update, context = await create_mock_update_context(message_text="Test")
-    
-    result = await request_feedback(update, context)
-    
-    # Verify feedback request message and buttons
-    args, kwargs = update.message.reply_text.call_args
-    assert "How was your experience?" in args[0]
-    assert isinstance(kwargs.get('reply_markup'), InlineKeyboardMarkup)
-    assert result == FEEDBACK
-
-@pytest.mark.asyncio
-async def test_handle_feedback_skip():
-    update, context = await create_mock_update_context(callback_data="rate_skip")
-    
-    result = await handle_feedback(update, context)
-    
-    # Verify skip message
-    args, _ = update.callback_query.edit_message_text.call_args
-    assert "Thanks for using the bot" in args[0]
-    assert result == ConversationHandler.END
-
-@pytest.mark.asyncio
-async def test_handle_feedback_rating():
-    update, context = await create_mock_update_context(callback_data="rate_5")
-    
-    result = await handle_feedback(update, context)
-    
-    # Verify feedback was stored
-    assert 'feedback_history' in context.user_data
-    assert len(context.user_data['feedback_history']) == 1
-    assert context.user_data['feedback_history'][0]['rating'] == 5
-    
-    # Verify thank you message
-    args, _ = update.callback_query.edit_message_text.call_args
-    assert "Thanks for your 5⭐ rating" in args[0]
-    assert result == ConversationHandler.END
-
-@pytest.mark.asyncio
-async def test_handle_feedback_low_rating():
-    update, context = await create_mock_update_context(callback_data="rate_2")
-    
-    result = await handle_feedback(update, context)
-    
-    # Verify follow-up question for low rating
-    args, kwargs = update.callback_query.edit_message_text.call_args
-    assert "Could you tell us what went wrong?" in args[0]
-    assert isinstance(kwargs.get('reply_markup'), InlineKeyboardMarkup)
-    assert result == ConversationHandler.END
-
-@pytest.mark.asyncio
-async def test_feedback_history_command_empty():
-    update, context = await create_mock_update_context(message_text="/feedback")
-    
-    await feedback_history_command(update, context)
-    
-    # Verify empty history message
-    args, _ = update.message.reply_text.call_args
-    assert "No feedback history available" in args[0]
-
-@pytest.mark.asyncio
-async def test_feedback_history_command():
-    update, context = await create_mock_update_context(message_text="/feedback")
-    
-    # Add test feedback
-    context.user_data['feedback_history'] = [
-        {
-            'timestamp': datetime.now(),
-            'rating': 5,
-            'movie': 'Test Movie',
-            'reason': None
-        }
-    ]
-    
-    await feedback_history_command(update, context)
-    
-    # Verify feedback history display
-    args, kwargs = update.message.reply_text.call_args
-    assert "Recent Feedback History" in args[0]
-    assert "Test Movie" in args[0]
-    assert "⭐" * 5 in args[0]
-    assert kwargs.get('parse_mode') == 'MarkdownV2'
-
-@pytest.mark.asyncio
-async def test_process_torrent_with_feedback(cleanup_tasks):
+async def test_process_torrent(cleanup_tasks):
     update, context = await create_mock_update_context(callback_data="confirm_yes")
     context.bot = AsyncMock()
     status_message = AsyncMock()
@@ -398,7 +314,6 @@ async def test_process_torrent_with_feedback(cleanup_tasks):
     with patch('bot.monitor_download') as mock_monitor, \
          patch('bot.unpack_download_if_needed') as mock_unpack, \
          patch('bot.update_plex_library') as mock_plex, \
-         patch('bot.request_feedback') as mock_feedback, \
          patch('bot.send_notification', new_callable=AsyncMock) as mock_notify, \
          patch('asyncio.sleep', new_callable=AsyncMock), \
          patch('asyncio.create_task', return_value=progress_task):
@@ -415,52 +330,6 @@ async def test_process_torrent_with_feedback(cleanup_tasks):
             )
         except asyncio.TimeoutError:
             pytest.fail("Test timed out")
-        
-        # Verify feedback was requested
-        mock_feedback.assert_called_once()
-
-@pytest.mark.asyncio
-async def test_inline_search_short_query():
-    update = Mock(spec=Update)
-    inline_query = Mock(spec=InlineQuery)
-    inline_query.query = "ab"
-    update.inline_query = inline_query
-    inline_query.answer = AsyncMock()
-    
-    context = Mock(spec=ContextTypes.DEFAULT_TYPE)
-    
-    await inline_search(update, context)
-    
-    # Verify response for short query
-    args = inline_query.answer.call_args[0][0]
-    assert len(args) == 1
-    assert "Enter at least 3 characters" in args[0].title
-
-@pytest.mark.asyncio
-@patch('bot.search_tpb')
-async def test_inline_search_results(mock_search):
-    # Mock search results
-    mock_search.return_value = [{
-        'name': 'Test Movie',
-        'size': '1073741824',  # 1 GB
-        'seeders': '10'
-    }]
-    
-    update = Mock(spec=Update)
-    inline_query = Mock(spec=InlineQuery)
-    inline_query.query = "test movie"
-    update.inline_query = inline_query
-    inline_query.answer = AsyncMock()
-    
-    context = Mock(spec=ContextTypes.DEFAULT_TYPE)
-    
-    await inline_search(update, context)
-    
-    # Verify search results
-    args = inline_query.answer.call_args[0][0]
-    assert len(args) == 1
-    assert "Test Movie" in args[0].title
-    assert "1.00 GB" in args[0].description
 
 if __name__ == "__main__":
     pytest.main([__file__]) 

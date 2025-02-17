@@ -26,7 +26,7 @@ from security import restricted_access, admin_only, check_file_size_limit
 from user_manager import user_manager, UserRole
 
 # Define conversation states
-MOVIE, SELECT, CONFIRM, HISTORY_SELECT, FEEDBACK = range(5)
+MOVIE, SELECT, CONFIRM, HISTORY_SELECT = range(4)
 
 # Set up logging
 logging.basicConfig(
@@ -342,10 +342,6 @@ async def process_torrent(update: Update, context: ContextTypes.DEFAULT_TYPE, se
         await status_message.edit_text(success_message)
         await send_notification(update, context, success_message)
         
-        # Request feedback after a short delay
-        await asyncio.sleep(2)  # Give user time to read success message
-        await request_feedback(update, context)
-        
     except Exception as e:
         logger.error(f"Error processing torrent: {e}")
         if 'status_message' in locals():
@@ -503,225 +499,6 @@ def mark_history_downloaded(context: ContextTypes.DEFAULT_TYPE, query: str, torr
             break
 
 @async_error_handler
-async def request_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Request user feedback after successful download"""
-    keyboard = [
-        [
-            InlineKeyboardButton("⭐⭐⭐⭐⭐", callback_data="rate_5"),
-            InlineKeyboardButton("⭐⭐⭐⭐", callback_data="rate_4"),
-        ],
-        [
-            InlineKeyboardButton("⭐⭐⭐", callback_data="rate_3"),
-            InlineKeyboardButton("⭐⭐", callback_data="rate_2"),
-            InlineKeyboardButton("⭐", callback_data="rate_1"),
-        ],
-        [
-            InlineKeyboardButton("Skip ➡️", callback_data="rate_skip")
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    if update.message:
-        await update.message.reply_text(
-            "How was your experience? Please rate the download:\n"
-            "(This helps us improve the service)",
-            reply_markup=reply_markup
-        )
-    elif update.callback_query:
-        await update.callback_query.message.reply_text(
-            "How was your experience? Please rate the download:\n"
-            "(This helps us improve the service)",
-            reply_markup=reply_markup
-        )
-    return FEEDBACK
-
-@rate_limit("feedback")
-@async_error_handler
-async def handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle user's feedback response"""
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == "rate_skip":
-        await query.edit_message_text(
-            "Thanks for using the bot! Let me know if you need anything else."
-        )
-        return ConversationHandler.END
-        
-    rating = int(query.data.split('_')[1])
-    
-    # Store the rating in user_data
-    if 'feedback_history' not in context.user_data:
-        context.user_data['feedback_history'] = []
-    
-    feedback_entry = {
-        'timestamp': datetime.now(),
-        'rating': rating,
-        'movie': context.user_data.get('selected_torrent', {}).get('name', 'Unknown')
-    }
-    
-    context.user_data['feedback_history'].append(feedback_entry)
-    
-    # For low ratings, ask what went wrong
-    if rating <= 3:
-        keyboard = [
-            [InlineKeyboardButton(reason, callback_data=f"reason_{i}")]
-            for i, reason in enumerate([
-                "Download too slow",
-                "Quality issues",
-                "Wrong movie",
-                "Other issues"
-            ])
-        ]
-        keyboard.append([InlineKeyboardButton("Skip ➡️", callback_data="reason_skip")])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            f"Thanks for your {rating}⭐ rating.\n"
-            "Could you tell us what went wrong?",
-            reply_markup=reply_markup
-        )
-    else:
-        await query.edit_message_text(
-            f"Thanks for your {rating}⭐ rating!\n"
-            "Let me know if you need anything else."
-        )
-    
-    return ConversationHandler.END
-
-@async_error_handler
-async def feedback_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show feedback history for admins"""
-    # You might want to add admin check here
-    if not context.user_data.get('feedback_history'):
-        await update.message.reply_text(
-            "No feedback history available."
-        )
-        return
-        
-    history = context.user_data['feedback_history']
-    message = "📊 *Recent Feedback History*\n\n"
-    
-    for entry in reversed(history[-10:]):  # Show last 10 feedbacks
-        stars = "⭐" * entry['rating']
-        movie_name = entry['movie'].replace('-', '\\-').replace('.', '\\.').replace('_', '\\_')
-        timestamp = entry['timestamp'].strftime("%Y-%m-%d %H:%M")
-        
-        message += (
-            f"Movie: `{movie_name}`\n"
-            f"Rating: {stars}\n"
-            f"Date: {timestamp}\n"
-            f"{'Reason: ' + entry.get('reason', 'Not provided') if entry.get('reason') else ''}\n\n"
-        )
-    
-    await update.message.reply_text(message, parse_mode='MarkdownV2')
-
-@restricted_access()
-@rate_limit("inline_search")
-@async_error_handler
-async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle inline queries for movie searches"""
-    query = update.inline_query.query
-    
-    if len(query) < 3:
-        # Don't search for very short queries
-        results = [
-            InlineQueryResultArticle(
-                id=str(uuid4()),
-                title="Enter at least 3 characters",
-                input_message_content=InputTextMessageContent(
-                    "Please enter at least 3 characters to search for movies."
-                ),
-                description="Type more to search..."
-            )
-        ]
-    else:
-        try:
-            # Search for torrents
-            torrents = search_tpb(query)[:5]  # Limit to top 5 results
-            
-            results = []
-            for torrent in torrents:
-                # Format size
-                size_bytes = int(torrent.get('size', 0))
-                size_gb = size_bytes / (1024 * 1024 * 1024)
-                size_str = f"{size_gb:.2f} GB"
-                
-                # Create result article
-                results.append(
-                    InlineQueryResultArticle(
-                        id=str(uuid4()),
-                        title=torrent.get('name', 'Unknown'),
-                        description=f"💾 {size_str} | 🌱 {torrent.get('seeders', 'N/A')} seeders",
-                        input_message_content=InputTextMessageContent(
-                            f"🎬 *{torrent.get('name', 'Unknown')}*\n"
-                            f"💾 Size: `{size_str}`\n"
-                            f"🌱 Seeders: `{torrent.get('seeders', 'N/A')}`\n\n"
-                            "Use /start to download this movie",
-                            parse_mode='MarkdownV2'
-                        ),
-                        thumb_url="https://example.com/movie-icon.png",  # Add a movie icon
-                    )
-                )
-            
-            if not results:
-                results = [
-                    InlineQueryResultArticle(
-                        id=str(uuid4()),
-                        title="No results found",
-                        input_message_content=InputTextMessageContent(
-                            f"No torrents found for '{query}'"
-                        ),
-                        description="Try a different search term"
-                    )
-                ]
-        
-        except Exception as e:
-            logger.error(f"Error in inline search: {e}")
-            results = [
-                InlineQueryResultArticle(
-                    id=str(uuid4()),
-                    title="Error occurred",
-                    input_message_content=InputTextMessageContent(
-                        "Sorry, an error occurred while searching. Please try again later."
-                    ),
-                    description="Search failed"
-                )
-            ]
-    
-    await update.inline_query.answer(results, cache_time=300)
-
-# Add new admin commands
-@admin_only()
-@async_error_handler
-async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = "*Registered Users:*\n\n"
-    for user in user_manager.users.values():
-        message += (
-            f"ID: `{user.user_id}`\n"
-            f"Username: @{user.username}\n"
-            f"Role: {user.role.value}\n"
-            f"Created: {user.created_at[:10]}\n"
-            f"Last active: {user.last_active[:10]}\n\n"
-        )
-    await update.message.reply_text(message, parse_mode='MarkdownV2')
-
-@admin_only()
-@async_error_handler
-async def promote_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        user_id = int(context.args[0])
-        if user := user_manager.get_user(user_id):
-            user.role = UserRole.ADMIN
-            user.max_file_size = float('inf')
-            user_manager.save_users()
-            await update.message.reply_text(f"User {user_id} promoted to admin.")
-        else:
-            await update.message.reply_text("User not found.")
-    except (ValueError, IndexError):
-        await update.message.reply_text("Usage: /promote <user_id>")
-
-@async_error_handler
 async def handle_torrent_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: int) -> int:
     """Handle torrent selection and show confirmation"""
     query = update.callback_query
@@ -771,7 +548,6 @@ def main() -> None:
             MOVIE: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_movie)],
             SELECT: [CallbackQueryHandler(select_torrent_callback)],
             CONFIRM: [CallbackQueryHandler(select_torrent_callback)],
-            FEEDBACK: [CallbackQueryHandler(handle_feedback)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
@@ -782,10 +558,6 @@ def main() -> None:
     application.add_handler(CommandHandler("recent", recent_movies))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("history", history_command))
-    application.add_handler(CommandHandler("feedback", feedback_history_command))
-    application.add_handler(InlineQueryHandler(inline_search))
-    application.add_handler(CommandHandler("list_users", list_users))
-    application.add_handler(CommandHandler("promote", promote_user))
     application.run_polling()
 
 if __name__ == '__main__':

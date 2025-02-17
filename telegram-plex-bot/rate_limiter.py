@@ -18,7 +18,6 @@ class RateLimiter:
             'select_torrent': (3, 60),  # 3 selections per minute
             'recent': (10, 60),         # 10 recent checks per minute
             'history': (10, 60),        # 10 history checks per minute
-            'feedback': (5, 60),        # 5 feedback submissions per minute
             'default': (20, 60),        # Default limit for other commands
             'inline_search': (10, 60),  # 10 inline searches per minute
         }
