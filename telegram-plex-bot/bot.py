@@ -1,32 +1,36 @@
 import asyncio
 import logging
 from functools import wraps
-from telegram import Update, InlineKeyboardButton, Message, InlineKeyboardMarkup, InlineQueryResultArticle, InputTextMessageContent, InlineQuery
+from datetime import datetime
+from typing import Dict, List
+from uuid import uuid4
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CommandHandler,
     MessageHandler,
     ConversationHandler,
     ContextTypes,
     filters,
     CallbackQueryHandler,
-    InlineQueryHandler,
 )
-from config import TELEGRAM_BOT_TOKEN  # Make sure this is correctly configured
+
+from config import TELEGRAM_BOT_TOKEN
 from downloader import search_tpb, add_torrent, monitor_download
 from unpacker import unpack_download_if_needed
 from plex_uploader import update_plex_library, get_recent_movies
 from notifier import send_notification
-import json
-from datetime import datetime
-from typing import Dict, List
 from rate_limiter import rate_limit
-from uuid import uuid4
 from security import restricted_access, admin_only, check_file_size_limit
 from user_manager import user_manager, UserRole
 
 # Define conversation states
-MOVIE, SELECT, CONFIRM, HISTORY_SELECT = range(4)
+MOVIE, SELECT, CONFIRM = range(3)
 
 # Set up logging
 logging.basicConfig(
@@ -350,18 +354,6 @@ async def process_torrent(update: Update, context: ContextTypes.DEFAULT_TYPE, se
             )
         raise
 
-@rate_limit("recent")
-@async_error_handler
-async def recent_movies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    movies = get_recent_movies(limit=5)
-    if movies:
-        message = "Last 5 updated movies in Plex:\n"
-        for movie in movies:
-            message += f"{movie.title} - Updated at: {movie.updatedAt}\n"
-        await update.message.reply_text(message)
-    else:
-        await update.message.reply_text("No movies found in Plex.")
-
 @async_error_handler
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Operation cancelled.")
@@ -372,11 +364,6 @@ async def update_plex_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     logger.info("Received command to update Plex library.")
     plex_message = update_plex_library("")  # Pass an empty string if not needed
     await update.message.reply_text(plex_message)
-
-@async_error_handler
-async def recent_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await recent_movies(update, context)
-    return ConversationHandler.END
 
 @async_error_handler
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -535,7 +522,8 @@ async def handle_torrent_selection(update: Update, context: ContextTypes.DEFAULT
     return CONFIRM
 
 def main() -> None:
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    # Initialize bot with token
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     # Create conversation handler for the main flow
     conv_handler = ConversationHandler(
@@ -547,18 +535,24 @@ def main() -> None:
         states={
             MOVIE: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_movie)],
             SELECT: [CallbackQueryHandler(select_torrent_callback)],
-            CONFIRM: [CallbackQueryHandler(select_torrent_callback)],
+            CONFIRM: [CallbackQueryHandler(handle_confirmation)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
     )
 
-    # Add all handlers
+    # Add handlers
     application.add_handler(conv_handler)
-    application.add_handler(CommandHandler("recent", recent_movies))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("history", history_command))
-    application.run_polling()
+    application.add_handler(CommandHandler("update_plex", update_plex_command))
+
+    # Start the bot with proper error handling
+    try:
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    except Exception as e:
+        logger.error(f"Error starting bot: {e}")
+        raise
 
 if __name__ == '__main__':
     main()
