@@ -2,7 +2,7 @@ import pytest
 import asyncio
 import json
 from unittest.mock import patch, MagicMock
-from downloader import search_tpb, add_torrent, monitor_download
+from downloader import search_tpb, add_torrent, monitor_download, retry_download, rank_torrents
 
 # Test for search_tpb: simulate a HTTP error.
 def test_search_tpb_http_error(caplog):
@@ -45,3 +45,83 @@ async def test_monitor_download_timeout():
     with patch("downloader.qb.torrents_info", return_value=[fake_torrent]):
         result = await monitor_download("12345", timeout=3, poll_interval=1)
         assert result is False
+
+# Async test for retry_download: simulate success on second attempt
+@pytest.mark.asyncio
+async def test_retry_download_success_on_retry():
+    # Mock monitor_download to fail on first attempt, succeed on second
+    monitor_results = [False, True]
+    
+    async def mock_monitor_side_effect(*args, **kwargs):
+        return monitor_results.pop(0)
+    
+    with patch("downloader.monitor_download", side_effect=mock_monitor_side_effect), \
+         patch("downloader.asyncio.sleep") as mock_sleep:
+        result = await retry_download("12345", max_attempts=3, retry_delay=1)
+        assert result is True
+        assert mock_sleep.call_count == 1  # Should sleep once after first failure
+
+# Async test for retry_download: simulate all attempts failing
+@pytest.mark.asyncio
+async def test_retry_download_all_attempts_fail():
+    with patch("downloader.monitor_download", return_value=False), \
+         patch("downloader.asyncio.sleep") as mock_sleep:
+        result = await retry_download("12345", max_attempts=2, retry_delay=1)
+        assert result is False
+        assert mock_sleep.call_count == 2  # Should sleep after each failure
+
+# Test for rank_torrents: verify torrents are ranked correctly
+def test_rank_torrents():
+    # Create sample torrents with different characteristics
+    torrents = [
+        {
+            "name": "Low seeds, good size",
+            "seeders": "5",
+            "leechers": "10",
+            "size": str(5 * 1024**3),  # 5GB
+            "status": ""
+        },
+        {
+            "name": "High seeds, good size, trusted",
+            "seeders": "100",
+            "leechers": "10",
+            "size": str(8 * 1024**3),  # 8GB
+            "status": "trusted"
+        },
+        {
+            "name": "High seeds, too large",
+            "seeders": "50",
+            "leechers": "5",
+            "size": str(25 * 1024**3),  # 25GB
+            "status": ""
+        },
+        {
+            "name": "Extremely high seeds",
+            "seeders": "1000",
+            "leechers": "10",
+            "size": str(5 * 1024**3),  # 5GB
+            "status": ""
+        }
+    ]
+    
+    # Rank the torrents
+    ranked = rank_torrents(torrents)
+    
+    # Print the actual scores for debugging
+    for torrent in ranked:
+        print(f"{torrent['name']}: {torrent['quality_score']}")
+    
+    # Verify the order is correct (highest score first)
+    assert ranked[0]["name"] == "High seeds, good size, trusted"
+    assert ranked[1]["name"] == "Extremely high seeds"
+    
+    # The order of the next two might vary depending on exact scoring
+    # Just verify they're both in the list
+    assert any(t["name"] == "High seeds, too large" for t in ranked[2:])
+    assert any(t["name"] == "Low seeds, good size" for t in ranked[2:])
+    
+    # Verify scores were calculated and added
+    for torrent in ranked:
+        assert "quality_score" in torrent
+        # Ensure no score exceeds 25
+        assert torrent["quality_score"] <= 25

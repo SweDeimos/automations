@@ -2,8 +2,12 @@ import asyncio
 import logging
 from functools import wraps
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Any, Optional, Callable, Tuple
 from uuid import uuid4
+import re
+import html
+import sys
+import os
 
 from telegram import (
     Update,
@@ -22,22 +26,36 @@ from telegram.ext import (
 )
 
 from config import TELEGRAM_BOT_TOKEN
-from downloader import search_tpb, add_torrent, monitor_download
+from downloader import search_tpb, add_torrent, monitor_download, retry_download
 from unpacker import unpack_download_if_needed
 from plex_uploader import update_plex_library, get_recent_movies
-from notifier import send_notification
+from notifier import send_notification, notify_admins
 from rate_limiter import rate_limit
-from security import restricted_access, admin_only, check_file_size_limit
+from security import restricted_access, admin_only, check_file_size_limit, security
 from user_manager import user_manager, UserRole
 
 # Define conversation states
 MOVIE, SELECT, CONFIRM = range(3)
 
-# Set up logging
+# Ensure logs directory exists
+os.makedirs("logs", exist_ok=True)
+
+# Set up logging with proper encoding for Windows console
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler("logs/bot.log", encoding='utf-8'),
+    ]
 )
+
+# Add console handler with proper encoding
+console_handler = logging.StreamHandler(stream=sys.stdout)
+console_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+logging.getLogger().addHandler(console_handler)
+
 logger = logging.getLogger(__name__)
+logger.info("Bot logging initialized")
 
 # Define specific error messages based on the function and error type
 error_messages = {
@@ -60,6 +78,10 @@ error_messages = {
 
 # --- Error Handler Decorator ---
 def async_error_handler(func):
+    """
+    Decorator to handle exceptions in async functions.
+    Logs the exception and sends an appropriate error message to the user.
+    """
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         try:
@@ -83,11 +105,116 @@ def async_error_handler(func):
             
     return wrapper
 
+# --- Helper Functions ---
+
+def format_torrent_message(torrent: Dict[str, Any], idx: int) -> str:
+    """Format a single torrent entry for display"""
+    try:
+        size_bytes = int(torrent.get('size', 0))
+        size_mb = size_bytes / (1024 * 1024)
+        size_gb = size_bytes / (1024 * 1024 * 1024)
+        size_str = f"{size_gb:.2f} GB" if size_gb > 1 else f"{size_mb:.2f} MB"
+        
+        # Include quality score if available
+        quality_score = torrent.get('quality_score')
+        quality_info = f" | Quality: {quality_score:.1f}/25" if quality_score is not None else ""
+        
+        return f"{idx}. {torrent.get('name', 'Unknown')} | Size: {size_str} | Seeds: {torrent.get('seeders', 'N/A')}{quality_info}"
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Error converting size for torrent {torrent.get('name', 'Unknown')}: {e}")
+        return f"{idx}. {torrent.get('name', 'Unknown')} | Size: N/A | Seeds: {torrent.get('seeders', 'N/A')}"
+
+def create_torrent_pagination(
+    all_results: List[Dict[str, Any]], 
+    page: int, 
+    items_per_page: int = 5
+) -> Tuple[List[Dict[str, Any]], str, InlineKeyboardMarkup]:
+    """
+    Create pagination for movie torrent results
+    
+    Args:
+        all_results: List of all movie torrent results
+        page: Current page number (0-indexed)
+        items_per_page: Number of items per page
+        
+    Returns:
+        Tuple of (current_page_items, message_text, reply_markup)
+    """
+    start_idx = page * items_per_page
+    current_page_items = all_results[start_idx:start_idx + items_per_page]
+    
+    # Create message text
+    message = f"Found {len(all_results)} movie torrents (showing {start_idx + 1}-{start_idx + len(current_page_items)}):\n\n"
+    for idx, torrent in enumerate(current_page_items, start=1):
+        message += format_torrent_message(torrent, idx) + "\n"
+    
+    # Create selection buttons
+    keyboard = [
+        [InlineKeyboardButton(f"{idx}. {torrent.get('name', 'Unknown')}", callback_data=f"select_{idx}")]
+        for idx, torrent in enumerate(current_page_items, start=1)
+    ]
+    
+    # Add navigation row if there are more results
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data="prev_page"))
+    if (page + 1) * items_per_page < len(all_results):
+        nav_row.append(InlineKeyboardButton("Next ➡️", callback_data="next_page"))
+    if nav_row:
+        keyboard.append(nav_row)
+        
+    # Add search again button
+    keyboard.append([InlineKeyboardButton("🔄 New Search", callback_data="new_search")])
+    
+    return current_page_items, message, InlineKeyboardMarkup(keyboard)
+
+def add_to_search_history(context: ContextTypes.DEFAULT_TYPE, query: str, selected_torrent: Dict = None):
+    """Add a search to the user's history"""
+    if 'search_history' not in context.user_data:
+        context.user_data['search_history'] = []
+        
+    # Add new search entry
+    entry = {
+        'query': query,
+        'timestamp': datetime.now(),
+        'selected_torrent': selected_torrent,
+        'downloaded': False
+    }
+    
+    history = context.user_data['search_history']
+    history.append(entry)
+    
+    # Keep only last 50 searches
+    if len(history) > 50:
+        context.user_data['search_history'] = history[-50:]
+
+def mark_history_downloaded(context: ContextTypes.DEFAULT_TYPE, query: str, torrent: Dict):
+    """Mark a search history entry as downloaded"""
+    if 'search_history' not in context.user_data:
+        return
+        
+    history = context.user_data['search_history']
+    # Find the most recent matching search
+    for entry in reversed(history):
+        if entry['query'] == query and not entry['downloaded']:
+            entry['downloaded'] = True
+            entry['selected_torrent'] = torrent
+            break
+
+def escape_markdown_v2(text):
+    """Escape special characters for Telegram's MarkdownV2 format."""
+    if not text:
+        return ""
+    # Characters that need to be escaped: _ * [ ] ( ) ~ ` > # + - = | { } . !
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', str(text))
+
 # --- Bot Handlers with Error Handler Decorator ---
 
 @restricted_access()
 @async_error_handler
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start the conversation and register the user if needed"""
     user_id = update.effective_user.id
     username = update.effective_user.username or "Unknown"
     
@@ -98,7 +225,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         user_manager.update_last_active(user_id)
     
     await update.message.reply_text(
-        "Hello! Send me a movie title, and I'll search for a torrent.\n\n"
+        "Hello! Send me a movie title, and I'll search for movie torrents.\n\n"
+        "This bot is for movies only and does not support TV series.\n\n"
         "Use /help to see all available commands."
     )
     return MOVIE
@@ -107,6 +235,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 @rate_limit("search_movie")
 @async_error_handler
 async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle movie search requests"""
+    user = update.effective_user
     movie_title = update.message.text.strip()
     if not movie_title:
         await update.message.reply_text("Please provide a movie title to search for.")
@@ -121,13 +251,22 @@ async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         action="typing"
     )
     
-    logger.info(f"Searching for '{movie_title}'...")
-    status_message = await update.message.reply_text("🔍 Searching for torrents...")
+    logger.info(f"👤 User {user.username or user.id} searching for '{movie_title}'")
+    status_message = await update.message.reply_text("🔍 Searching for movies...")
     
     try:
         if 'search_page' not in context.user_data:
             # New search
+            # search_tpb will return torrents ranked by quality score (seeds, size, trusted status)
             torrents = search_tpb(movie_title)
+            if not torrents:
+                logger.info(f"❌ No torrents found for '{movie_title}'")
+                await status_message.edit_text(
+                    f"No movie torrents found for '{movie_title}'.\n"
+                    "Please try another search term."
+                )
+                return MOVIE
+                
             user_id = update.effective_user.id
             
             # Filter torrents based on user's size limit
@@ -137,8 +276,9 @@ async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             ]
             
             if not allowed_torrents:
+                logger.info(f"⚠️ User {user.username or user.id} has no torrents within size limit for '{movie_title}'")
                 await update.message.reply_text(
-                    "No suitable torrents found within your size limit (50GB).\n"
+                    "No suitable movie torrents found within your size limit.\n"
                     "Try another search or contact an administrator."
                 )
                 return MOVIE
@@ -146,47 +286,17 @@ async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             # Store all results and current page
             context.user_data['all_results'] = allowed_torrents
             context.user_data['search_page'] = 0
+            
+            logger.info(f"✅ Found {len(allowed_torrents)} torrents for '{movie_title}' within size limits")
         
-        # Get current page of results
+        # Get current page of results using the pagination helper
         page = context.user_data['search_page']
         all_results = context.user_data['all_results']
-        start_idx = page * 5
-        top_5_torrents = all_results[start_idx:start_idx + 5]
         
-        message = f"Found {len(all_results)} torrents (showing {start_idx + 1}-{start_idx + len(top_5_torrents)}):\n\n"
-        for idx, torrent in enumerate(top_5_torrents, start=1):
-            try:
-                size_bytes = int(torrent.get('size', 0))
-                size_mb = size_bytes / (1024 * 1024)
-                size_gb = size_bytes / (1024 * 1024 * 1024)
-                size_str = f"{size_gb:.2f} GB" if size_gb > 1 else f"{size_mb:.2f} MB"
-                message += f"{idx}. {torrent.get('name', 'Unknown')} | Size: {size_str} | Seeds: {torrent.get('seeders', 'N/A')}\n"
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Error converting size for torrent {torrent.get('name', 'Unknown')}: {e}")
-                message += f"{idx}. {torrent.get('name', 'Unknown')} | Size: N/A | Seeds: {torrent.get('seeders', 'N/A')}\n"
+        current_page_items, message, reply_markup = create_torrent_pagination(all_results, page)
         
-        # Create navigation buttons
-        keyboard = [
-            [InlineKeyboardButton(f"{idx}. {torrent.get('name', 'Unknown')}", callback_data=f"select_{idx}")]
-            for idx, torrent in enumerate(top_5_torrents, start=1)
-        ]
-        
-        # Add navigation row if there are more results
-        nav_row = []
-        if page > 0:
-            nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data="prev_page"))
-        if (page + 1) * 5 < len(all_results):
-            nav_row.append(InlineKeyboardButton("Next ➡️", callback_data="next_page"))
-        if nav_row:
-            keyboard.append(nav_row)
-            
-        # Add search again button
-        keyboard.append([InlineKeyboardButton("🔄 New Search", callback_data="new_search")])
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        context.user_data["torrent_results"] = top_5_torrents
-        await update.message.reply_text(message, reply_markup=reply_markup)
+        context.user_data["torrent_results"] = current_page_items
+        await status_message.edit_text(message, reply_markup=reply_markup)
         return SELECT
     except Exception as e:
         logger.error(f"Error searching for movie: {e}")
@@ -196,6 +306,7 @@ async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 @rate_limit("select_torrent")
 @async_error_handler
 async def select_torrent_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle torrent selection from the search results"""
     query = update.callback_query
     await query.answer()
     
@@ -207,45 +318,13 @@ async def select_torrent_callback(update: Update, context: ContextTypes.DEFAULT_
             else:
                 context.user_data['search_page'] -= 1
             
-            # Get current page of results
+            # Get current page of results using the pagination helper
             page = context.user_data['search_page']
             all_results = context.user_data['all_results']
-            start_idx = page * 5
-            top_5_torrents = all_results[start_idx:start_idx + 5]
             
-            message = f"Found {len(all_results)} torrents (showing {start_idx + 1}-{start_idx + len(top_5_torrents)}):\n\n"
-            for idx, torrent in enumerate(top_5_torrents, start=1):
-                try:
-                    size_bytes = int(torrent.get('size', 0))
-                    size_mb = size_bytes / (1024 * 1024)
-                    size_gb = size_bytes / (1024 * 1024 * 1024)
-                    size_str = f"{size_gb:.2f} GB" if size_gb > 1 else f"{size_mb:.2f} MB"
-                    message += f"{idx}. {torrent.get('name', 'Unknown')} | Size: {size_str} | Seeds: {torrent.get('seeders', 'N/A')}\n"
-                except (ValueError, TypeError) as e:
-                    logger.warning(f"Error converting size for torrent {torrent.get('name', 'Unknown')}: {e}")
-                    message += f"{idx}. {torrent.get('name', 'Unknown')} | Size: N/A | Seeds: {torrent.get('seeders', 'N/A')}\n"
+            current_page_items, message, reply_markup = create_torrent_pagination(all_results, page)
             
-            # Create navigation buttons
-            keyboard = [
-                [InlineKeyboardButton(f"{idx}. {torrent.get('name', 'Unknown')}", callback_data=f"select_{idx}")]
-                for idx, torrent in enumerate(top_5_torrents, start=1)
-            ]
-            
-            # Add navigation row if there are more results
-            nav_row = []
-            if page > 0:
-                nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data="prev_page"))
-            if (page + 1) * 5 < len(all_results):
-                nav_row.append(InlineKeyboardButton("Next ➡️", callback_data="next_page"))
-            if nav_row:
-                keyboard.append(nav_row)
-                
-            # Add search again button
-            keyboard.append([InlineKeyboardButton("🔄 New Search", callback_data="new_search")])
-            
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            context.user_data["torrent_results"] = top_5_torrents
+            context.user_data["torrent_results"] = current_page_items
             await query.edit_message_text(message, reply_markup=reply_markup)
             return SELECT
         elif query.data == "new_search":
@@ -269,8 +348,48 @@ async def select_torrent_callback(update: Update, context: ContextTypes.DEFAULT_
         return SELECT
 
 @async_error_handler
-async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def handle_torrent_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: int) -> int:
+    """Handle torrent selection and show confirmation"""
     query = update.callback_query
+    user = update.effective_user
+    torrents = context.user_data.get("torrent_results")
+    
+    if not torrents or not (0 <= idx < len(torrents)):
+        await query.edit_message_text("Invalid selection or expired results. Please try again.")
+        return SELECT
+    
+    selected = torrents[idx]
+    context.user_data['selected_torrent'] = selected
+    
+    # Format size in GB
+    size_gb = int(selected['size']) / (1024 * 1024 * 1024)
+    size_formatted = f"{size_gb:.2f}"
+    
+    logger.info(f"👤 User {user.username or user.id} selected torrent: {selected['name']} ({size_formatted} GB)")
+    
+    # Create confirmation message
+    safe_name = html.escape(selected['name'])
+    confirm_message = (
+        f"<b>Confirm download:</b>\n\n<code>{safe_name}</code>\n\nSize: {size_formatted} GB"
+    )
+    
+    # Create keyboard for confirmation
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Yes, download", callback_data="confirm_yes"),
+            InlineKeyboardButton("❌ No, cancel", callback_data="confirm_no")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(confirm_message, reply_markup=reply_markup, parse_mode='HTML')
+    return CONFIRM
+
+@async_error_handler
+async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle confirmation of torrent download"""
+    query = update.callback_query
+    user = update.effective_user
     await query.answer()
     
     selected = context.user_data.get('selected_torrent')
@@ -281,6 +400,7 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
         
     if query.data == "confirm_no":
+        logger.info(f"👤 User {user.username or user.id} cancelled download of: {selected['name']}")
         await query.edit_message_text(
             "Download cancelled.\n"
             "You can search for another movie or select a different option."
@@ -296,14 +416,14 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode='Markdown'
         )
         
-        logger.info(f"Confirmed torrent download: {selected['name']}")
+        logger.info(f"👤 User {user.username or user.id} confirmed download of: {selected['name']}")
         info_hash = add_torrent(selected)
         
         if info_hash:
             # Mark as downloaded in history
             mark_history_downloaded(
                 context,
-                selected.get('search_query', ''),  # We'll add this below
+                selected.get('search_query', ''),
                 selected
             )
             
@@ -315,6 +435,7 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             asyncio.create_task(process_torrent(update, context, selected, info_hash))
         else:
+            logger.error(f"❌ Failed to add torrent: {selected['name']}")
             await query.edit_message_text(
                 f"❌ Failed to add torrent.\n\n"
                 f"Movie: `{selected['name']}`\n"
@@ -327,6 +448,8 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 @async_error_handler
 async def process_torrent(update: Update, context: ContextTypes.DEFAULT_TYPE, selected: dict, info_hash: str):
+    """Process the torrent download, extraction, and Plex update"""
+    user = update.effective_user
     try:
         # Store the status message in context for updating
         status_message = await context.bot.send_message(
@@ -352,8 +475,9 @@ async def process_torrent(update: Update, context: ContextTypes.DEFAULT_TYPE, se
         # Start progress updates in background
         progress_task = asyncio.create_task(update_progress())
         
-        # Monitor the download
-        download_success = await monitor_download(info_hash)
+        # Monitor the download with retry capability
+        logger.info(f"🔄 Starting download monitoring for {selected['name']} (hash: {info_hash})")
+        download_success = await retry_download(info_hash)
         
         # Cancel progress updates
         progress_task.cancel()
@@ -367,17 +491,20 @@ async def process_torrent(update: Update, context: ContextTypes.DEFAULT_TYPE, se
                 "• Insufficient disk space\n"
                 "Please try another torrent or search again."
             )
+            logger.error(f"❌ Download failed for {selected['name']} (hash: {info_hash})")
             await status_message.edit_text(error_msg)
             await send_notification(update, context, error_msg)
             return
 
         # Update status for unpacking
+        logger.info(f"📦 Processing downloaded files for {selected['name']}")
         await status_message.edit_text("📦 Processing downloaded files...")
         file_path = f"downloads/{selected['name']}"
         new_path = unpack_download_if_needed(file_path)
         final_path = new_path if new_path else file_path
 
         # Update status for Plex
+        logger.info(f"🎬 Adding {selected['name']} to Plex library")
         await status_message.edit_text("🎬 Adding to Plex library...")
         plex_message = update_plex_library(final_path)
         
@@ -386,8 +513,17 @@ async def process_torrent(update: Update, context: ContextTypes.DEFAULT_TYPE, se
             f"✅ Movie '{selected['name']}' is now on Plex!\n"
             f"{plex_message}"
         )
+        logger.info(f"✅ Successfully added {selected['name']} to Plex")
         await status_message.edit_text(success_message)
         await send_notification(update, context, success_message)
+        
+        # Notify admins about the successful download
+        admin_message = (
+            f"✅ New movie added to Plex\n"
+            f"Title: {selected['name']}\n"
+            f"Added by: {user.username or user.id}"
+        )
+        await notify_admins(admin_message)
         
     except Exception as e:
         logger.error(f"Error processing torrent: {e}")
@@ -399,58 +535,121 @@ async def process_torrent(update: Update, context: ContextTypes.DEFAULT_TYPE, se
 
 @async_error_handler
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancel the current operation"""
     await update.message.reply_text("Operation cancelled.")
     return ConversationHandler.END
 
+@restricted_access()
 @async_error_handler
 async def update_plex_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manually update the Plex library"""
     logger.info("Received command to update Plex library.")
+    await update.message.reply_text("Updating Plex library...")
     plex_message = update_plex_library("")  # Pass an empty string if not needed
     await update.message.reply_text(plex_message)
 
 @async_error_handler
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show help information"""
+    user_id = update.effective_user.id
+    is_admin = security.is_admin(user_id)
+    
     help_text = (
-        "🎬 *Movie Download Bot Help* 🎬\n\n"
-        "*Available Commands:*\n"
-        "/start \\- Start the bot and search for movies\n"
-        "/help \\- Show this help message\n"
-        "/recent \\- Show recently added movies to Plex\n"
-        "/history \\- View your recent searches\n"
-        "/search\\_again \\<number\\> \\- Repeat a previous search\n"
-        "/cancel \\- Cancel current operation\n\n"
-        "*How to use:*\n"
-        "1\\. Send a movie title to search for torrents\n"
-        "2\\. Select from the available options\n"
-        "3\\. The bot will download and add it to Plex automatically\n\n"
-        "The bot will notify you when the movie is ready to watch on Plex\\."
+        "<b>🎬 Telegram Plex Movie Bot Help</b>\n\n"
+        "<b>Commands:</b>\n"
+        "/search - Search for a movie (TV series not supported)\n"
+        "/recent - Show recently added movies\n"
+        "/history - Show your search history\n"
+        "/help - Show this help message\n"
     )
-    await update.message.reply_text(help_text, parse_mode='MarkdownV2')
+    
+    # Add admin commands if the user is an admin
+    if is_admin:
+        admin_help = (
+            "\n<b>Admin Commands:</b>\n"
+            "/adduser &lt;user_id&gt; [username] - Add a new user by Telegram ID\n"
+            "/update_plex - Force update the Plex library\n"
+        )
+        help_text += admin_help
+    
+    help_text += (
+        "\n<b>How to use:</b>\n"
+        "1. Send a movie title to search for movie torrents\n"
+        "2. Select from the available movie options (sorted by quality score)\n"
+        "3. The bot will download and add it to Plex automatically\n\n"
+        "<b>Features:</b>\n"
+        "• Smart quality ranking: Torrents are automatically ranked by a quality score\n"
+        "• Automatic retry: Failed downloads are retried with exponential backoff\n"
+        "• Size filtering: Only shows torrents within your allowed size limit\n\n"
+        "The bot will notify you when the movie is ready to watch on Plex.\n\n"
+        "<b>Note:</b> This bot is for movies only and does not support TV series."
+    )
+    await update.message.reply_text(help_text, parse_mode='HTML')
+
+@rate_limit("recent")
+@restricted_access()
+@async_error_handler
+async def recent_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show recently added movies to Plex"""
+    await update.message.reply_text("Fetching recent movies from Plex...")
+    
+    recent_movies = get_recent_movies(limit=10)
+    if not recent_movies:
+        await update.message.reply_text("No recent movies found or unable to connect to Plex.")
+        return
+        
+    message = "🎬 *Recently Added Movies* 🎬\n\n"
+    for movie in recent_movies:
+        title = html.escape(movie.title)
+        year = movie.year if hasattr(movie, 'year') else 'N/A'
+        added = movie.addedAt.strftime("%Y-%m-%d") if hasattr(movie, 'addedAt') else 'Unknown'
+        
+        message += f"🎥 <b>{title}</b> ({year})\n"
+        message += f"📅 Added: {added}\n\n"
+    
+    await update.message.reply_text(message, parse_mode='HTML')
 
 @rate_limit("history")
 @async_error_handler
+@restricted_access()
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show search history"""
     if not context.user_data.get('search_history'):
         await update.message.reply_text("No search history available.")
         return
         
     history = context.user_data['search_history']
-    message = "📖 *Your Recent Searches*\n\n"
+    message = "<b>📖 Your Recent Searches</b>\n\n"
     
-    for entry in reversed(history[-10:]):  # Show last 10 searches
-        # Escape special characters for MarkdownV2
-        query = entry['query'].replace('-', '\\-').replace('.', '\\.').replace('_', '\\_')
-        timestamp = entry['timestamp'].strftime("%Y\\-%m\\-%d %H:%M")
+    for idx, entry in enumerate(reversed(history[-10:]), start=1):  # Show last 10 searches
+        query = html.escape(entry['query'])
+        timestamp = entry['timestamp'].strftime("%Y-%m-%d %H:%M")
+        
+        message += f"{idx}. <b>{query}</b>\n📅 {timestamp}\n"
         
         if entry.get('downloaded'):
             torrent_name = entry.get('selected_torrent', {}).get('name', 'Unknown')
-            # Escape special characters in torrent name
-            safe_name = torrent_name.replace('-', '\\-').replace('.', '\\.').replace('_', '\\_')
-            message += f"🎬 *{query}*\n📅 {timestamp}\n✅ Downloaded: `{safe_name}`\n\n"
+            safe_name = html.escape(torrent_name)
+            message += f"✅ Downloaded: <code>{safe_name}</code>\n\n"
         else:
-            message += f"🎬 *{query}*\n📅 {timestamp}\n❌ Not downloaded\n\n"
+            message += f"❌ Not downloaded\n\n"
     
-    await update.message.reply_text(message, parse_mode='MarkdownV2')
+    message += "<i>Use /search_again &lt;number&gt; to repeat a search</i>"
+    
+    try:
+        await update.message.reply_text(message, parse_mode='HTML')
+    except Exception as e:
+        logging.error(f"Error sending message: {e}")
+        # Fallback to plain text if HTML fails
+        plain_message = "Your recent searches:\n\n"
+        for idx, entry in enumerate(reversed(history[-10:]), start=1):
+            plain_message += f"{idx}. {entry['query']} - {entry['timestamp'].strftime('%Y-%m-%d %H:%M')}\n"
+            if entry.get('downloaded'):
+                torrent_name = entry.get('selected_torrent', {}).get('name', 'Unknown')
+                plain_message += f"✅ Downloaded: {torrent_name}\n\n"
+            else:
+                plain_message += f"❌ Not downloaded\n\n"
+        await update.message.reply_text(plain_message)
 
 @async_error_handler
 async def search_again_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -495,76 +694,48 @@ async def search_again_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return ConversationHandler.END
 
-def add_to_search_history(context: ContextTypes.DEFAULT_TYPE, query: str, selected_torrent: Dict = None):
-    """Add a search to the user's history"""
-    if 'search_history' not in context.user_data:
-        context.user_data['search_history'] = []
-        
-    # Add new search entry
-    entry = {
-        'query': query,
-        'timestamp': datetime.now(),
-        'selected_torrent': selected_torrent,
-        'downloaded': False
-    }
-    
-    history = context.user_data['search_history']
-    history.append(entry)
-    
-    # Keep only last 50 searches
-    if len(history) > 50:
-        context.user_data['search_history'] = history[-50:]
-
-def mark_history_downloaded(context: ContextTypes.DEFAULT_TYPE, query: str, torrent: Dict):
-    """Mark a search history entry as downloaded"""
-    if 'search_history' not in context.user_data:
-        return
-        
-    history = context.user_data['search_history']
-    # Find the most recent matching search
-    for entry in reversed(history):
-        if entry['query'] == query and not entry['downloaded']:
-            entry['downloaded'] = True
-            entry['selected_torrent'] = torrent
-            break
-
 @async_error_handler
-async def handle_torrent_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: int) -> int:
-    """Handle torrent selection and show confirmation"""
-    query = update.callback_query
-    torrents = context.user_data.get("torrent_results")
+@admin_only()
+async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add a new user to the bot by their Telegram ID. Admin only command."""
+    user_id = update.effective_user.id
+    logger.info(f"Admin {user_id} is attempting to add a new user")
     
-    if not torrents or not (0 <= idx < len(torrents)):
-        await query.edit_message_text("Invalid selection or expired results. Please try again.")
-        return SELECT
+    # Check if the command has the correct format
+    if not context.args or len(context.args) < 1:
+        await update.message.reply_text(
+            "⚠️ Please provide the Telegram user ID to add.\n"
+            "Usage: /adduser <user_id> [username]"
+        )
+        return
     
-    selected = torrents[idx]
-    context.user_data['selected_torrent'] = selected
-    
-    # Create confirmation message with details
-    size_bytes = int(selected.get('size', 0))
-    size_gb = size_bytes / (1024 * 1024 * 1024)
-    safe_name = selected['name'].replace('-', '\\-').replace('.', '\\.').replace('_', '\\_')
-    confirm_message = (
-        f"📽 *Confirm Download*\n\n"
-        f"*Title:* `{safe_name}`\n"
-        f"*Size:* `{size_gb:.2f} GB`\n"
-        f"*Seeders:* `{selected.get('seeders', 'N/A')}`\n\n"
-        "Are you sure you want to download this torrent?"
-    )
-    
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Yes, download it", callback_data="confirm_yes"),
-            InlineKeyboardButton("❌ No, cancel", callback_data="confirm_no")
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(confirm_message, reply_markup=reply_markup, parse_mode='MarkdownV2')
-    return CONFIRM
+    try:
+        # Parse the user ID from the first argument
+        new_user_id = int(context.args[0])
+        
+        # Get username if provided, otherwise use "Unknown"
+        username = context.args[1] if len(context.args) > 1 else "Unknown"
+        
+        # Add the user
+        user = user_manager.add_user(new_user_id, username, UserRole.USER)
+        
+        await update.message.reply_text(
+            f"✅ User added successfully!\n"
+            f"ID: {new_user_id}\n"
+            f"Username: {username}\n"
+            f"Role: {user.role.value}\n"
+            f"Max file size: {user.max_file_size / (1024**3):.2f} GB"
+        )
+        
+        logger.info(f"Admin {user_id} added new user {new_user_id} ({username})")
+    except ValueError:
+        await update.message.reply_text("⚠️ Invalid user ID. Please provide a valid numeric Telegram ID.")
+    except Exception as e:
+        logger.error(f"Error adding user: {e}")
+        await update.message.reply_text(f"❌ Error adding user: {str(e)}")
 
 def main() -> None:
+    """Initialize and start the bot"""
     # Initialize bot with token
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
@@ -589,9 +760,12 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("history", history_command))
     application.add_handler(CommandHandler("update_plex", update_plex_command))
+    application.add_handler(CommandHandler("recent", recent_command))
+    application.add_handler(CommandHandler("adduser", add_user_command))
 
     # Start the bot with proper error handling
     try:
+        logger.info("🚀 Starting Telegram Plex Bot...")
         application.run_polling(allowed_updates=Update.ALL_TYPES)
     except Exception as e:
         logger.error(f"Error starting bot: {e}")

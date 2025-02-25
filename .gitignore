@@ -1,14 +1,21 @@
 # Ignore Python virtual environments
 venv/
+.venv/
 .env
 
 # Ignore compiled Python files
 __pycache__/
 *.py[cod]
+*$py.class
 
 # Ignore logs and debug files
 *.log
 debug.log
+logs/
+bot_startup.log
+*_output.txt
+verify_output.txt
+connections_output.txt
 
 # Ignore system-specific files
 .DS_Store
@@ -39,6 +46,8 @@ poetry.lock
 
 # Ignore any torrent-related files
 *.torrent
+downloads/
+extracted/
 
 # Ignore coverage reports
 htmlcov/
@@ -49,3 +58,33 @@ coverage.xml
 dist/
 build/
 *.egg-info/
+
+# Ignore sensitive data
+users.json
+.env
+secrets/
+credentials/
+tokens/
+auth/
+
+# Ignore media files
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.m4v
+*.srt
+*.sub
+
+# Ignore temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Ignore backup files
+*.bak
+*~
+*.swp
+*.swo
+backup/

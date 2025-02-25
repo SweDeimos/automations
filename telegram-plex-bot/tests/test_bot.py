@@ -88,7 +88,7 @@ async def test_search_movie_empty_title():
     
     # Verify error message for empty title
     update.message.reply_text.assert_called_once_with("Please provide a movie title to search for.")
-    assert result == 0  # MOVIE state
+    assert result == MOVIE
 
 @pytest.mark.asyncio
 @patch('bot.search_tpb')
