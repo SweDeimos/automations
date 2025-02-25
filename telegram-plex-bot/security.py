@@ -27,10 +27,19 @@ def restricted_access():
             
             if not security.is_user_allowed(user_id):
                 logger.warning(f"Unauthorized access attempt by user {user_id}")
-                await update.message.reply_text(
-                    "⛔ Sorry, you are not authorized to use this bot.\n"
-                    "Please contact the administrator for access."
-                )
+                if update.callback_query:
+                    await update.callback_query.answer(
+                        "⛔ Sorry, you are not authorized to use this bot.\n"
+                        "Please contact the administrator for access.",
+                        show_alert=True
+                    )
+                    return
+                elif update.message:
+                    await update.message.reply_text(
+                        "⛔ Sorry, you are not authorized to use this bot.\n"
+                        "Please contact the administrator for access."
+                    )
+                    return
                 return
                 
             return await func(update, context, *args, **kwargs)
@@ -46,9 +55,17 @@ def admin_only():
             
             if not user_manager.is_admin(user_id):
                 logger.warning(f"Unauthorized admin access attempt by user {user_id}")
-                await update.message.reply_text(
-                    "⛔ This command is only available to administrators."
-                )
+                if update.callback_query:
+                    await update.callback_query.answer(
+                        "⛔ This command is only available to administrators.",
+                        show_alert=True
+                    )
+                    return
+                elif update.message:
+                    await update.message.reply_text(
+                        "⛔ This command is only available to administrators."
+                    )
+                    return
                 return
             
             return await func(update, context, *args, **kwargs)
@@ -66,10 +83,16 @@ def check_file_size_limit():
             if torrent := context.user_data.get('selected_torrent'):
                 size = int(torrent.get('size', 0))
                 if not user_manager.can_access_file_size(user_id, size):
-                    await update.message.reply_text(
-                        "⚠️ This file exceeds your size limit (5GB).\n"
+                    error_message = (
+                        "⚠️ This file exceeds your size limit (50GB).\n"
                         "Please choose a smaller file or contact an administrator."
                     )
+                    if update.callback_query:
+                        await update.callback_query.answer(error_message, show_alert=True)
+                        return
+                    elif update.message:
+                        await update.message.reply_text(error_message)
+                        return
                     return
             
             return await func(update, context, *args, **kwargs)

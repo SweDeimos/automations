@@ -9,6 +9,7 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    Message,
 )
 from telegram.ext import (
     Application,
@@ -137,7 +138,7 @@ async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             
             if not allowed_torrents:
                 await update.message.reply_text(
-                    "No suitable torrents found within your size limit (5GB).\n"
+                    "No suitable torrents found within your size limit (50GB).\n"
                     "Try another search or contact an administrator."
                 )
                 return MOVIE
@@ -199,12 +200,54 @@ async def select_torrent_callback(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     
     try:
-        if query.data == "next_page":
-            context.user_data['search_page'] += 1
-            return await search_movie(update, context)
-        elif query.data == "prev_page":
-            context.user_data['search_page'] -= 1
-            return await search_movie(update, context)
+        if query.data == "next_page" or query.data == "prev_page":
+            # Update page number
+            if query.data == "next_page":
+                context.user_data['search_page'] += 1
+            else:
+                context.user_data['search_page'] -= 1
+            
+            # Get current page of results
+            page = context.user_data['search_page']
+            all_results = context.user_data['all_results']
+            start_idx = page * 5
+            top_5_torrents = all_results[start_idx:start_idx + 5]
+            
+            message = f"Found {len(all_results)} torrents (showing {start_idx + 1}-{start_idx + len(top_5_torrents)}):\n\n"
+            for idx, torrent in enumerate(top_5_torrents, start=1):
+                try:
+                    size_bytes = int(torrent.get('size', 0))
+                    size_mb = size_bytes / (1024 * 1024)
+                    size_gb = size_bytes / (1024 * 1024 * 1024)
+                    size_str = f"{size_gb:.2f} GB" if size_gb > 1 else f"{size_mb:.2f} MB"
+                    message += f"{idx}. {torrent.get('name', 'Unknown')} | Size: {size_str} | Seeds: {torrent.get('seeders', 'N/A')}\n"
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Error converting size for torrent {torrent.get('name', 'Unknown')}: {e}")
+                    message += f"{idx}. {torrent.get('name', 'Unknown')} | Size: N/A | Seeds: {torrent.get('seeders', 'N/A')}\n"
+            
+            # Create navigation buttons
+            keyboard = [
+                [InlineKeyboardButton(f"{idx}. {torrent.get('name', 'Unknown')}", callback_data=f"select_{idx}")]
+                for idx, torrent in enumerate(top_5_torrents, start=1)
+            ]
+            
+            # Add navigation row if there are more results
+            nav_row = []
+            if page > 0:
+                nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data="prev_page"))
+            if (page + 1) * 5 < len(all_results):
+                nav_row.append(InlineKeyboardButton("Next ➡️", callback_data="next_page"))
+            if nav_row:
+                keyboard.append(nav_row)
+                
+            # Add search again button
+            keyboard.append([InlineKeyboardButton("🔄 New Search", callback_data="new_search")])
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            context.user_data["torrent_results"] = top_5_torrents
+            await query.edit_message_text(message, reply_markup=reply_markup)
+            return SELECT
         elif query.data == "new_search":
             # Clear search data and prompt for new search
             context.user_data.pop('search_page', None)

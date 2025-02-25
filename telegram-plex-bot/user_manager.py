@@ -50,7 +50,7 @@ class UserManager:
             json.dump(users_data, f, indent=2)
     
     def add_user(self, user_id: int, username: str, role: UserRole = UserRole.USER) -> User:
-        max_file_size = 5_368_709_120 if role == UserRole.USER else 1_099_511_627_776  # 5GB for users, 1TB for admins
+        max_file_size = 53_687_091_200 if role == UserRole.USER else 1_099_511_627_776  # 50GB for users, 1TB for admins
         user = User(
             user_id=user_id,
             username=username,

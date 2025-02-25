@@ -4,6 +4,7 @@ from functools import wraps
 import logging
 from telegram import Update
 from telegram.ext import ContextTypes
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -57,22 +58,46 @@ class RateLimiter:
 # Create a global rate limiter instance
 rate_limiter = RateLimiter()
 
-def rate_limit(command_name: str):
-    """Decorator to apply rate limiting to bot commands"""
+def rate_limit(command: str):
+    """Rate limit decorator for bot commands"""
     def decorator(func):
         @wraps(func)
         async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
             user_id = update.effective_user.id
+            now = time.time()
             
-            if rate_limiter.is_rate_limited(user_id, command_name):
-                limit, window = rate_limiter.rate_limits.get(command_name, rate_limiter.rate_limits['default'])
-                await update.message.reply_text(
-                    f"⚠️ Rate limit exceeded. You can use this command {limit} times per {window} seconds.\n"
-                    "Please try again later."
+            # Initialize user's rate limit data if not exists
+            if user_id not in rate_limiter.command_history:
+                rate_limiter.command_history[user_id] = []
+            
+            if command not in rate_limiter.command_history[user_id]:
+                rate_limiter.command_history[user_id][command] = []
+            
+            # Clean old timestamps
+            rate_limiter.command_history[user_id][command] = [
+                ts for ts in rate_limiter.command_history[user_id][command]
+                if now - ts < rate_limiter.rate_limits[command][1]
+            ]
+            
+            # Check if user has exceeded rate limit
+            if len(rate_limiter.command_history[user_id][command]) >= rate_limiter.rate_limits[command][0]:
+                error_message = (
+                    "⚠️ You're making too many requests.\n"
+                    f"Please wait {rate_limiter.rate_limits[command][1]} seconds before trying again."
                 )
-                logger.warning(f"Rate limit exceeded for user {user_id} on command {command_name}")
-                return
                 
+                # Handle both message and callback query updates
+                if update.callback_query:
+                    await update.callback_query.answer(error_message, show_alert=True)
+                    return
+                elif update.message:
+                    await update.message.reply_text(error_message)
+                    return
+                return
+            
+            # Add current timestamp
+            rate_limiter.command_history[user_id][command].append(now)
+            
             return await func(update, context, *args, **kwargs)
         return wrapper
     return decorator 
